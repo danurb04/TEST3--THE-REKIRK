@@ -36,7 +36,7 @@ F_MIN_STATIONS = 7
 F_MAXPROB = 0.879
 F_MIN_STRONG = 5
 F_MIN_DET_SUPPORT = 50  # prueba 6–10, tú tienes 73 estaciones
-
+F_MIN_S_SUPPORT = 10
 
 # =====================
 # Helpers: oficial
@@ -414,6 +414,7 @@ def main():
 
         # calcula soporte para cada evento
         events_det["det_support"] = events_det["t0"].apply(lambda t0: det_support_count(t0, det_idx, slack_sec=2.0))
+        events_det["S_support"] = events_det["t0"].apply(lambda t0: count_phase_support(picks, t0, "S", 0.5, 20.0))
 
         print("Det-support stats (p25/med/p75):",
             np.percentile(events_det["det_support"], [25,50,75]))
@@ -426,13 +427,14 @@ def main():
         (events_det["n_stations"] >= F_MIN_STATIONS) &
         (events_det["maxprob"] >= F_MAXPROB) &
         (events_det["n_strong"] >= F_MIN_STRONG) &
-        (events_det["det_support"] >= F_MIN_DET_SUPPORT)
+        (events_det["det_support"] >= F_MIN_DET_SUPPORT) &
+        (events_det["S_support"] >= F_MIN_S_SUPPORT)
     ].reset_index(drop=True)
 
 
     print(
         f"\nEventos IA LOC tras filtrado: {len(events_loc)} "
-        f"(nsta>={F_MIN_STATIONS}, maxprob>={F_MAXPROB}, n_strong>={F_MIN_STRONG}, det_support>={F_MIN_DET_SUPPORT})"
+        f"(nsta>={F_MIN_STATIONS}, maxprob>={F_MAXPROB}, n_strong>={F_MIN_STRONG}, det_support>={F_MIN_DET_SUPPORT}, S_support>={F_MIN_S_SUPPORT})"
     )
 
     m_loc = match_events_to_official(official, events_loc, tol_sec=MATCH_TOL_SEC)
