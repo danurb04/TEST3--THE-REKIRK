@@ -35,6 +35,7 @@ STRONG_THR = 0.75
 F_MIN_STATIONS = 7
 F_MAXPROB = 0.879
 F_MIN_STRONG = 5
+F_MIN_DET_SUPPORT = 50  # prueba 6–10, tú tienes 73 estaciones
 
 
 # =====================
@@ -296,7 +297,68 @@ def debug_near_misses(official, events, tol_sec=15.0, near_sec=60.0):
             row = events.iloc[j]
             print(f"idx={i} t0={r['t0_utc']}  nearest_dt={best_dt:.2f}s  nsta={row['n_stations']}  maxprob={row.get('maxprob', np.nan):.3f}")
 
+# =====================
+# Normalización: SeisBench detections CSV -> formato tuyo
+# =====================
+def normalize_seisbench_detections(det_raw: pd.DataFrame) -> pd.DataFrame:
+    d = det_raw.copy()
 
+    # nombres típicos de SeisBench DetectionList.to_dataframe()
+    # start_time / end_time deberían existir
+    if "start_time" not in d.columns or "end_time" not in d.columns:
+        raise ValueError(f"Detections sin start_time/end_time. Columnas: {list(d.columns)}")
+
+    d["start_time"] = pd.to_datetime(d["start_time"], errors="coerce")
+    d["end_time"]   = pd.to_datetime(d["end_time"], errors="coerce")
+    d = d.dropna(subset=["start_time", "end_time"])
+
+    # station_code si existe, si no extrae de trace_id
+    if "station_code" in d.columns:
+        d["station"] = d["station_code"].astype(str)
+    elif "station" in d.columns:
+        d["station"] = d["station"].astype(str).apply(lambda x: str(x).split(".")[1] if "." in str(x) else str(x))
+    else:
+        raise ValueError(f"Detections sin station/station_code. Columnas: {list(d.columns)}")
+
+    # a epoch seconds para comparar con tu t0
+    d["start_t"] = d["start_time"].astype("int64") / 1e9
+    d["end_t"]   = d["end_time"].astype("int64") / 1e9
+
+    return d[["station", "start_t", "end_t"]].sort_values(["station", "start_t"]).reset_index(drop=True)
+
+
+def build_det_index(det_norm: pd.DataFrame):
+    """
+    Devuelve dict station -> (start_array, end_array) ordenados por start.
+    """
+    idx = {}
+    for sta, g in det_norm.groupby("station"):
+        idx[sta] = (g["start_t"].to_numpy(), g["end_t"].to_numpy())
+    return idx
+
+# =====================
+# Detections index -> count support
+# =====================
+def det_support_count(t0: float, det_idx: dict, slack_sec: float = 0.0) -> int:
+    """
+    slack_sec permite tolerancia: cuenta detections que cubren [t0-slack, t0+slack]
+    """
+    tL = t0 - slack_sec
+    tR = t0 + slack_sec
+
+    n = 0
+    for sta, (starts, ends) in det_idx.items():
+        # Encontrar detections cuyo start <= tR
+        # y verificar si alguna tiene end >= tL
+        # (búsqueda rápida con searchsorted)
+        j = np.searchsorted(starts, tR, side="right") - 1
+        if j >= 0 and ends[j] >= tL:
+            n += 1
+    return n
+def count_phase_support(picks, t0, phase, w0, w1):
+    # picks: tu df normalizado (station, phase, t, prob)
+    w = picks[(picks["phase"] == phase) & (picks["t"] >= t0 + w0) & (picks["t"] <= t0 + w1)]
+    return w["station"].nunique()
 # =====================
 # MAIN
 # =====================
@@ -329,8 +391,6 @@ def main():
     print(f"Oficiales con ≥1 estación con P-pick: {ge1}/{len(reportP)}")
     print(f"Oficiales con ≥2 estaciones con P-pick: {ge2}/{len(reportP)}")
     print(f"Oficiales con ≥3 estaciones con P-pick: {ge3}/{len(reportP)}")
-    print("\nTop 10 oficiales por # estaciones con P:")
-    print(reportP.sort_values("n_stations_P", ascending=False).head(10).to_string(index=False))
 
     # ---- Binning P ----
     picksP = bin_best_pick_per_station(picks, bin_sec=BIN_SEC, phase="P")
@@ -346,17 +406,33 @@ def main():
     print("\n=== MATCH EVENTOS DET vs OFICIAL (±15s) ===")
     print(f"Matches DET: {m_det['is_match'].sum()}/{len(m_det)}")
     print(m_det.sort_values("dt_sec").to_string(index=False))
+    # cargar detections si existe
+    if Path(DETECTIONS_CSV).exists():
+        det_raw = pd.read_csv(DETECTIONS_CSV)
+        det_norm = normalize_seisbench_detections(det_raw)
+        det_idx = build_det_index(det_norm)
+
+        # calcula soporte para cada evento
+        events_det["det_support"] = events_det["t0"].apply(lambda t0: det_support_count(t0, det_idx, slack_sec=2.0))
+
+        print("Det-support stats (p25/med/p75):",
+            np.percentile(events_det["det_support"], [25,50,75]))
+    else:
+        events_det["det_support"] = 0
 
     # ---- Eventos IA LOC (filtrado) ----
+    
     events_loc = events_det[
         (events_det["n_stations"] >= F_MIN_STATIONS) &
         (events_det["maxprob"] >= F_MAXPROB) &
-        (events_det["n_strong"] >= F_MIN_STRONG)
+        (events_det["n_strong"] >= F_MIN_STRONG) &
+        (events_det["det_support"] >= F_MIN_DET_SUPPORT)
     ].reset_index(drop=True)
+
 
     print(
         f"\nEventos IA LOC tras filtrado: {len(events_loc)} "
-        f"(nsta>={F_MIN_STATIONS}, maxprob>={F_MAXPROB}, n_strong>={F_MIN_STRONG})"
+        f"(nsta>={F_MIN_STATIONS}, maxprob>={F_MAXPROB}, n_strong>={F_MIN_STRONG}, det_support>={F_MIN_DET_SUPPORT})"
     )
 
     m_loc = match_events_to_official(official, events_loc, tol_sec=MATCH_TOL_SEC)
@@ -365,6 +441,7 @@ def main():
     print("\n=== MATCH EVENTOS LOC vs OFICIAL (±15s) ===")
     print(f"Matches LOC: {m_loc['is_match'].sum()}/{len(m_loc)}")
     print(m_loc.sort_values("dt_sec").to_string(index=False))
+    
 
     # ---- (Opcional) Si existe detections CSV, imprime resumen ----
     if Path(DETECTIONS_CSV).exists():
