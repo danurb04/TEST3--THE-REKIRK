@@ -10,7 +10,7 @@ import pandas as pd
 # CONFIG
 # =====================
 YEAR = 2024
-JDAY = 190
+JDAY = 191
 JSTR = f"{YEAR}{JDAY:03d}"
 
 # Entradas SeisBench (de tu 01)
@@ -20,20 +20,20 @@ DETECTIONS_CSV = f"detections_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"  # opcio
 # Oficial (Excel)
 OFFICIAL_XLSX = "catalogo_oficial.xlsx"
 OFFICIAL_SHEET = 0
-OFFICIAL_DAY = 20240708  # AJUSTA al día real (yyyymmdd)
+OFFICIAL_DAY = 20240709  # AJUSTA al día real (yyyymmdd)
 
 MATCH_TOL_SEC = 15.0
 
 # Parámetros para construir “eventos IA” (DET) con picks P
 BIN_SEC = 8.0
-WIN_SEC = 25.0
+WIN_SEC = 30.0
 MIN_STATIONS = 4
 DEAD_SEC = 18.0
 STRONG_THR = 0.75
 
 # Filtros “LOC” (para localizar, no para recall)
 F_MIN_STATIONS = 7
-F_MAXPROB = 0.879
+F_MAXPROB = 0.85
 F_MIN_STRONG = 5
 F_MIN_DET_SUPPORT = 50  # prueba 6–10, tú tienes 73 estaciones
 F_MIN_S_SUPPORT = 10
@@ -360,6 +360,22 @@ def count_phase_support(picks, t0, phase, w0, w1):
     w = picks[(picks["phase"] == phase) & (picks["t"] >= t0 + w0) & (picks["t"] <= t0 + w1)]
     return w["station"].nunique()
 # =====================
+# Requisito mínimo de picks S según características del evento
+# =====================
+#def min_s_required(row):
+    nsta = row["n_stations"]
+    maxp = row["maxprob"]
+    nstr = row["n_strong"]
+    dets = row["det_support"]
+
+    # "rescate": evento súper fuerte en P + alto soporte de detections
+    if (nsta >= 13) and (nstr >= 10) and (maxp >= 0.925) and (dets >= 50):
+        return 4
+    return 10
+
+
+
+# =====================
 # MAIN
 # =====================
 def main():
@@ -422,7 +438,8 @@ def main():
         events_det["det_support"] = 0
 
     # ---- Eventos IA LOC (filtrado) ----
-    
+    #events_det["S_req"] = events_det.apply(min_s_required, axis=1)
+
     events_loc = events_det[
         (events_det["n_stations"] >= F_MIN_STATIONS) &
         (events_det["maxprob"] >= F_MAXPROB) &
@@ -436,6 +453,7 @@ def main():
         f"\nEventos IA LOC tras filtrado: {len(events_loc)} "
         f"(nsta>={F_MIN_STATIONS}, maxprob>={F_MAXPROB}, n_strong>={F_MIN_STRONG}, det_support>={F_MIN_DET_SUPPORT}, S_support>={F_MIN_S_SUPPORT})"
     )
+    
 
     m_loc = match_events_to_official(official, events_loc, tol_sec=MATCH_TOL_SEC)
     debug_near_misses(official, events_loc, tol_sec=MATCH_TOL_SEC, near_sec=90.0)
