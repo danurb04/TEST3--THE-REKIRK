@@ -5,8 +5,8 @@ import pandas as pd
 
 # Configuracion temporal
 YEAR = 2024
-JDAY = 189
-OFFICIAL_DAY = 20240707  # AJUSTAR al día real (yyyymmdd)
+JDAY = 190
+OFFICIAL_DAY = 20240708  # AJUSTAR al día real (yyyymmdd)
 JSTR = f"{YEAR}{JDAY:03d}"
 
 # Entradas 
@@ -203,23 +203,23 @@ def count_phase_support(picks, t0, phase, w0, w1):
     return w["station"].nunique()
 
 def main():
-    t_start = time.time()
+    t_start = time.time() # inicio medicion tiempo de ejecucion
 
-    official = load_official_day(OFFICIAL_XLSX, OFFICIAL_SHEET, OFFICIAL_DAY)
+    official = load_official_day(OFFICIAL_XLSX, OFFICIAL_SHEET, OFFICIAL_DAY) # carga catalogo oficial
     print(f"Oficial {OFFICIAL_DAY}: {len(official)} eventos")
 
-    raw_picks = pd.read_csv(PICKS_CSV)
+    raw_picks = pd.read_csv(PICKS_CSV) # carga picks
     print(f"Picks SeisBench cargados: {len(raw_picks)}({PICKS_CSV})")
 
-    picks = normalize_eqt_picks(raw_picks)
+    picks = normalize_eqt_picks(raw_picks) # normaliza formato picks
     print(f"Picks normalizados: {len(picks)}  columnas={list(picks.columns)}")
 
     # ---- Binning P ----
-    picksP = bin_best_pick_per_station(picks, bin_sec=BIN_SEC, phase="P")
+    picksP = bin_best_pick_per_station(picks, bin_sec=BIN_SEC, phase="P") 
     print(f"\nP-picks tras bin ({BIN_SEC:.0f}s): {len(picksP)}")
 
     # ---- Construccion de eventos con ventana ----
-    events_det = build_events_sliding_window(
+    events_det = build_events_sliding_window( 
         picksP, win_sec=WIN_SEC, min_stations=MIN_STATIONS, dead_sec=DEAD_SEC, strong_thr=STRONG_THR
     )
     print(f"Eventos sin filtro: {len(events_det)}")
@@ -234,7 +234,7 @@ def main():
     events_det["det_support"] = events_det["t0"].apply(lambda t0: det_support_count(t0, det_idx, slack_sec=2.0))
     events_det["S_support"] = events_det["t0"].apply(lambda t0: count_phase_support(picks, t0, "S", -3, 20.0))
 
-
+    # ---- Filtrado de eventos ----
     events_loc = events_det[
         (events_det["n_stations"] >= F_MIN_STATIONS) &
         (events_det["maxprob"] >= F_MAXPROB) &
