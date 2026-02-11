@@ -12,13 +12,17 @@ JSTR = f"{YEAR}{JDAY:03d}"
 # Entradas 
 PICKS_CSV = f"picks_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"
 DETECTIONS_CSV = f"detections_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"  # opcional (si existe)
+NODES_XLSX = "XML_Cartago_Nodes.xlsx"  # code,longitude,latitude,elevation,site
+OUT_EVENTS_LOC_CSV = f"events_loc_{JSTR}.csv" # eventos localizados tras filtrado
 
 # Catalogo Oficial
 OFFICIAL_XLSX = "catalogo_oficial.xlsx"
 OFFICIAL_SHEET = 0
 
 # Tolerancia para match entre eventos IA y oficiales 
-MATCH_TOL_SEC = 15.0
+T_TOL = 15.0      # segundos
+D_TOL_KM = 15.0   # km (ajústalo)
+Z_TOL_KM = 10.0   # km (ajústalo)
 
 # Parámetros para construir eventos
 BIN_SEC = 8.0 # agrupa picks en este tiempo (en una misma estacion) para quedarse con el más fuerte 
@@ -33,6 +37,41 @@ F_MAXPROB = 0.85 # probabilidad máxima necesaria de una estación para consider
 F_MIN_STRONG = 5 # mínimo de estaciones con picks P fuertes para un mismo evento
 F_MIN_DET_SUPPORT = 50  # mínimo de detecciones (no picks) dentro de un evento para considerarlo 
 F_MIN_S_SUPPORT = 10 # mínimo de picks S dentro de un evento para considerarlo
+
+# Ventana para asignar picks al evento
+P_WIN = (-5.0, 10.0)   # seconds relative to t0
+S_WIN = (-3.0, 25.0)
+
+# Grid (ajústalo a Cartago / tu red)
+LAT_MIN, LAT_MAX, DLAT = 9.25, 10.12, 0.01 
+LON_MIN, LON_MAX, DLON = -84.7, -83.16, 0.01
+DEPTHS_KM = [1, 3, 5, 8, 10, 15, 20] 
+
+# Modelo 1D por capas (desde superficie, en km) ---
+# thickness_km, Vp, Vs
+VEL_LAYERS = [
+    (4.0,  4.45, 2.50),
+    (2.0,  5.50, 3.00),
+    (2.0,  5.60, 3.15),
+    (3.0,  6.00, 3.37),
+    (3.0,  6.15, 3.45),
+    (7.0,  6.25, 3.51),
+    (7.0,  6.50, 3.65),
+    (6.0,  6.80, 3.82),
+    (10.0, 7.00, 3.93),
+    (10.0, 7.30, 4.10),
+    (20.0, 7.90, 4.44),
+    (30.0, 8.20, 4.60),
+    (20.0, 8.30, 4.66),
+    (10.0, 8.35, 4.69),
+    (50.0, 8.40, 4.72),
+]
+
+
+# Parámetros para imprimir progreso 
+PRINT_EVERY = 1          # imprime cada N eventos (1 = todos)
+SHOW_GRID_PROGRESS = True
+GRID_PROGRESS_EVERY = 20000   # cada cuántas celdas del grid imprime avance (fine/coarse)
 
 # Carga catalogo oficial
 def load_official_day(xlsx_path, sheet, day_yyyymmdd):
@@ -202,6 +241,248 @@ def count_phase_support(picks, t0, phase, w0, w1):
     w = picks[(picks["phase"] == phase) & (picks["t"] >= t0 + w0) & (picks["t"] <= t0 + w1)]
     return w["station"].nunique()
 
+#====================
+# Funciones para Localización por grid search
+#====================
+def load_station_nodes(path):
+    if str(path).lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(path)
+    else:
+        df = pd.read_csv(path)
+
+    # columnas tal como vienen: code, longitude, latitude, elevation
+    df = df.rename(columns={
+        "code": "station",
+        "longitude": "lon",
+        "latitude": "lat",
+        "elevation": "elev_m"
+    })
+
+    # limpiar tipos
+    df["station"] = df["station"].astype(str).str.strip()
+    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+    df["elev_m"] = pd.to_numeric(df["elev_m"], errors="coerce")
+
+    df = df.dropna(subset=["station", "lat", "lon"]).reset_index(drop=True)
+    df["elev_km"] = df["elev_m"].fillna(0.0) / 1000.0
+    return df[["station", "lat", "lon", "elev_km"]]
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    # distancia aproximada en km
+    R = 6371.0
+    lat1 = np.deg2rad(lat1); lon1 = np.deg2rad(lon1)
+    lat2 = np.deg2rad(lat2); lon2 = np.deg2rad(lon2)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat/2)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
+    return 2*R*np.arcsin(np.sqrt(a))
+
+def picks_for_event(picks: pd.DataFrame, t0: float, phase: str, w: tuple[float,float]) -> pd.DataFrame:
+    w0, w1 = w
+    d = picks[(picks["phase"] == phase) & (picks["t"] >= t0 + w0) & (picks["t"] <= t0 + w1)].copy()
+    if d.empty:
+        return d
+    # 1 pick por estación: el de mayor prob (más robusto que "primero")
+    d = d.sort_values("prob", ascending=False).drop_duplicates("station", keep="first")
+    return d
+
+
+def travel_time_layered(dist_km: float, depth_km: float, phase: str) -> float:
+    """
+    Tiempo de viaje con rayo recto en un medio estratificado por capas horizontales.
+    dist_km: distancia horizontal
+    depth_km: profundidad fuente (positiva)
+    phase: "P" o "S"
+    """
+    depth_km = float(max(depth_km, 0.0))
+    # longitud total del rayo (recto)
+    L = float(np.sqrt(dist_km**2 + depth_km**2))
+    if L <= 0:
+        return 0.0
+
+    # proyección vertical del rayo: z(s) = (depth/L)*s
+    # => fracción de camino dentro de cada intervalo de profundidad
+    tt = 0.0
+    z0 = 0.0
+    z1 = depth_km
+
+    # recorre capas desde z=0 hasta z=depth_km
+    for i, (th, vp, vs) in enumerate(VEL_LAYERS):
+        top = LAYER_TOPS[i]
+        bot = LAYER_TOPS[i+1]
+
+        # segmento del rayo que cae dentro de [top, bot] intersectado con [0, depth]
+        a = max(top, 0.0)
+        b = min(bot, z1)
+        if b <= a:
+            if top >= z1:
+                break
+            continue
+
+        # convertir tramo vertical (dz) a tramo a lo largo del rayo (ds)
+        dz = b - a
+        ds = dz * (L / depth_km) if depth_km > 0 else 0.0
+
+        v = vp if phase == "P" else vs
+        tt += ds / v
+
+        if bot >= z1:
+            break
+
+    return float(tt)
+
+def locate_event_grid(pP, pS, stations,
+                      lat_min=LAT_MIN, lat_max=LAT_MAX, dlat=DLAT,
+                      lon_min=LON_MIN, lon_max=LON_MAX, dlon=DLON,
+                      depths_km=DEPTHS_KM):
+    # Une observaciones (fase, tiempo observado) por estación
+    obs = []
+    for _, r in pP.iterrows():
+        if r["station"] in stations.index:
+            obs.append((r["station"], "P", float(r["t"])))
+    for _, r in pS.iterrows():
+        if r["station"] in stations.index:
+            obs.append((r["station"], "S", float(r["t"])))
+    if len(obs) < 4:
+        return None  # muy pocos datos para una localización razonable
+
+    st_lats = stations.loc[[o[0] for o in obs], "lat"].to_numpy()
+    st_lons = stations.loc[[o[0] for o in obs], "lon"].to_numpy()
+    phases  = np.array([o[1] for o in obs])
+    t_obs   = np.array([o[2] for o in obs])
+
+    lats = np.arange(lat_min, lat_max + 1e-12, dlat)
+    lons = np.arange(lon_min, lon_max + 1e-12, dlon)
+
+    best = None  # (rms, lat, lon, dep, t_origin)
+
+    for dep in depths_km:
+        dep = float(dep)
+        for lat in lats:
+            # vectoriza por lon
+            for lon in lons:
+                dist = haversine_km(lat, lon, st_lats, st_lons)
+                path = np.sqrt(dist**2 + dep**2)
+                st_elev = stations.loc[[o[0] for o in obs], "elev_km"].to_numpy()
+
+                tt = np.array([
+                    travel_time_layered(float(dist[i]), float(dep + st_elev[i]), phases[i])
+                    for i in range(len(obs))
+                ], dtype=float)
+
+
+
+                # origin time por least squares: t_obs ≈ t_origin + tt
+                # => t_origin = median(t_obs - tt) (robusto)
+                t_origin = np.median(t_obs - tt)
+
+                res = (t_obs - (t_origin + tt))
+                rms = float(np.sqrt(np.mean(res**2)))
+
+                if (best is None) or (rms < best[0]):
+                    best = (rms, float(lat), float(lon), dep, float(t_origin))
+
+    return best
+
+
+def build_layer_tops(layers):
+    # Devuelve límites acumulados: [0, z1, z2, ...]
+    tops = [0.0]
+    z = 0.0
+    for th, _, _ in layers:
+        z += float(th)
+        tops.append(z)
+    return np.array(tops)
+
+LAYER_TOPS = build_layer_tops(VEL_LAYERS)
+
+
+
+#====================
+# Funciones para comparar eventos localizados con catálogo oficial
+#====================
+
+def match_loc_to_official(official_df: pd.DataFrame, loc_df: pd.DataFrame,
+                          t_tol=T_TOL, d_tol_km=D_TOL_KM, z_tol_km=Z_TOL_KM):
+    """
+    Retorna tabla por cada oficial con el mejor match (si existe).
+    Requiere:
+      official_df: t0_utc, lat, lon, depth_km
+      loc_df: origin_time_utc, lat, lon, depth_km
+    """
+    off = official_df.copy()
+    loc = loc_df[loc_df["ok"] == True].copy()
+
+    off["t0"] = pd.to_datetime(off["t0_utc"])
+    loc["t0"] = pd.to_datetime(loc["origin_time_utc"])
+
+    loc_t = (loc["t0"].astype("int64") / 1e9).to_numpy()
+    out_rows = []
+
+    for i, r in off.iterrows():
+        t_off = float(pd.to_datetime(r["t0"]).value / 1e9)
+
+        # candidatos por tiempo
+        dt = np.abs(loc_t - t_off)
+        cand_idx = np.where(dt <= t_tol)[0]
+        if cand_idx.size == 0:
+            out_rows.append({"idx_official": i, "is_match": False, "score": np.nan})
+            continue
+
+        best = None
+        for j in cand_idx:
+            rr = loc.iloc[j]
+            dkm = haversine_km(r["lat"], r["lon"], rr["lat"], rr["lon"])
+            dz  = abs(float(r["depth_km"]) - float(rr["depth_km"]))
+            dtj = float(loc_t[j] - t_off)
+
+            ok = (dkm <= d_tol_km) and (dz <= z_tol_km)
+            # score: prioriza tiempo, luego distancia, luego profundidad
+            score = abs(dtj) + 0.2*dkm + 0.1*dz
+
+            if ok and ((best is None) or (score < best["score"])):
+                best = {
+                    "idx_official": i,
+                    "t0_official": r["t0"],
+                    "lat_off": float(r["lat"]),
+                    "lon_off": float(r["lon"]),
+                    "dep_off": float(r["depth_km"]),
+                    "event_idx": int(rr["event_idx"]),
+                    "t0_loc": rr["t0"],
+                    "lat_loc": float(rr["lat"]),
+                    "lon_loc": float(rr["lon"]),
+                    "dep_loc": float(rr["depth_km"]),
+                    "dt_sec": dtj,
+                    "dist_km": float(dkm),
+                    "ddep_km": float(dz),
+                    "rms_sec": float(rr.get("rms_sec", np.nan)),
+                    "score": float(score),
+                    "is_match": True,
+                }
+
+        if best is None:
+            # si no hubo ok por dist/prof, guarda el más cercano en tiempo para diagnosticar
+            j0 = cand_idx[np.argmin(dt[cand_idx])]
+            rr0 = loc.iloc[j0]
+            dkm0 = haversine_km(r["lat"], r["lon"], rr0["lat"], rr0["lon"])
+            dz0  = abs(float(r["depth_km"]) - float(rr0["depth_km"]))
+            dt0  = float(loc_t[j0] - t_off)
+
+            out_rows.append({
+                "idx_official": i,
+                "is_match": False,
+                "dt_sec": dt0,
+                "dist_km": float(dkm0),
+                "ddep_km": float(dz0),
+                "event_idx": int(rr0["event_idx"]),
+                "score": np.nan,
+            })
+        else:
+            out_rows.append(best)
+
+    return pd.DataFrame(out_rows)
+
 def main():
     t_start = time.time() # inicio medicion tiempo de ejecucion
 
@@ -248,7 +529,70 @@ def main():
         f"\nEventos tras filtrado: {len(events_loc)} "
     )
     
-    
+    stations = load_station_nodes(NODES_XLSX).set_index("station")
+    print(f"Estaciones cargadas: {len(stations)}")
+
+    rows = []
+    for idx, ev in events_loc.iterrows():
+        t0 = float(ev["t0"])
+        t_event_start = time.time()
+        if (idx % PRINT_EVERY) == 0:
+           print(f"\n[LOC] evento {idx+1}/{len(events_loc)}  t0={pd.to_datetime(t0, unit='s')}  nsta={int(ev['n_stations'])}  det={int(ev['det_support'])}  S={int(ev['S_support'])}")
+
+        
+
+        pP = picks_for_event(picks, t0, "P", P_WIN)
+        pS = picks_for_event(picks, t0, "S", S_WIN)
+
+        sol = locate_event_grid(pP, pS, stations)
+        if sol is None:
+            print(f"[LOC]   -> FAIL (pocos picks)  nP={len(pP)} nS={len(pS)}  dt={time.time()-t_event_start:.1f}s")
+            rows.append({
+                "event_idx": int(idx),
+                "t0_seed": pd.to_datetime(t0, unit="s"),
+                "ok": False,
+                "nP": int(len(pP)),
+                "nS": int(len(pS)),
+            })
+            
+            continue
+
+        rms, lat, lon, dep, torigin = sol
+        print(f"[LOC]   -> OK  rms={rms:.2f}s  lat={lat:.3f} lon={lon:.3f} z={dep:.1f}km  nP={len(pP)} nS={len(pS)}  dt={time.time()-t_event_start:.1f}s")
+        rows.append({
+            "event_idx": int(idx),
+            "t0_seed": pd.to_datetime(t0, unit="s"),
+            "origin_time_utc": pd.to_datetime(torigin, unit="s"),
+            "lat": lat,
+            "lon": lon,
+            "depth_km": dep,
+            "rms_sec": rms,
+            "nP": int(len(pP)),
+            "nS": int(len(pS)),
+            "nsta_event": int(ev["n_stations"]),
+            "maxprob": float(ev["maxprob"]),
+            "det_support": int(ev["det_support"]),
+            "S_support": int(ev["S_support"]),
+            "ok": True,
+        })
+
+    loc_df = pd.DataFrame(rows).sort_values("origin_time_utc")
+    # loc_df.to_csv(OUT_EVENTS_LOC_CSV, index=False)
+
+    # comparar con oficial si existe
+    m = match_loc_to_official(official, loc_df)
+    m_ok = m[m["is_match"] == True].copy()
+    m_bad = m[m["is_match"] == False].copy()
+    m_ok["event_idx"] = m_ok["event_idx"].astype(int)
+
+    print("\n=== MATCH LOCALIZADO vs OFICIAL (solo matches) ===")
+    print(m_ok.sort_values("score").to_string(index=False))
+
+    print("\n=== NO MATCH (idx_official) ===")
+    print(m_bad["idx_official"].to_list())
+
+
+    #print(f"💾 Localizaciones guardadas: {OUT_EVENTS_LOC_CSV}  (ok={loc_df['ok'].sum()}/{len(loc_df)})")
     print(f"\n⏱ Total: {time.time() - t_start:.1f}s")
 
 
