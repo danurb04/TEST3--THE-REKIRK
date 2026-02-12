@@ -1,7 +1,9 @@
+from cProfile import label
 import time
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import heapq
 
 # Configuracion temporal
 YEAR = 2024
@@ -67,6 +69,13 @@ VEL_LAYERS = [
     (50.0, 8.40, 4.72),
 ]
 
+# Coarse grid (rápido)
+DLAT_C = 0.05
+DLON_C = 0.05
+DEPTHS_COARSE = [3, 8, 15]
+COARSE_TOPK = 8
+# Fine search alrededor del mejor coarse
+REFINE_HALFSPAN_DEG = 0.06   # +/- grados alrededor del coarse best
 
 # Parámetros para imprimir progreso 
 PRINT_EVERY = 1          # imprime cada N eventos (1 = todos)
@@ -336,7 +345,8 @@ def locate_event_grid(pP, pS, stations,
                       lat_min=LAT_MIN, lat_max=LAT_MAX, dlat=DLAT,
                       lon_min=LON_MIN, lon_max=LON_MAX, dlon=DLON,
                       depths_km=DEPTHS_KM):
-    # Une observaciones (fase, tiempo observado) por estación
+
+    # ---- arma observaciones ----
     obs = []
     for _, r in pP.iterrows():
         if r["station"] in stations.index:
@@ -344,46 +354,94 @@ def locate_event_grid(pP, pS, stations,
     for _, r in pS.iterrows():
         if r["station"] in stations.index:
             obs.append((r["station"], "S", float(r["t"])))
-    if len(obs) < 4:
-        return None  # muy pocos datos para una localización razonable
 
-    st_lats = stations.loc[[o[0] for o in obs], "lat"].to_numpy()
-    st_lons = stations.loc[[o[0] for o in obs], "lon"].to_numpy()
+    if len(obs) < 4:
+        return None
+
+    stas    = [o[0] for o in obs]
+    st_lats = stations.loc[stas, "lat"].to_numpy()
+    st_lons = stations.loc[stas, "lon"].to_numpy()
+    st_elev = stations.loc[stas, "elev_km"].to_numpy()
     phases  = np.array([o[1] for o in obs])
     t_obs   = np.array([o[2] for o in obs])
 
-    lats = np.arange(lat_min, lat_max + 1e-12, dlat)
-    lons = np.arange(lon_min, lon_max + 1e-12, dlon)
+    
 
-    best = None  # (rms, lat, lon, dep, t_origin)
+    def eval_grid(lats, lons, depths, label="grid"):
+        bests = []  # heap de tamaño COARSE_TOPK: (-rms, cand)
+        total = len(depths) * len(lats) * len(lons)
+        k = 0
 
-    for dep in depths_km:
-        dep = float(dep)
-        for lat in lats:
-            # vectoriza por lon
-            for lon in lons:
-                dist = haversine_km(lat, lon, st_lats, st_lons)
-                path = np.sqrt(dist**2 + dep**2)
-                st_elev = stations.loc[[o[0] for o in obs], "elev_km"].to_numpy()
+        for dep in depths:
+            dep = float(dep)
+            for lat in lats:
+                for lon in lons:
+                    dist = haversine_km(lat, lon, st_lats, st_lons)
 
-                tt = np.array([
-                    travel_time_layered(float(dist[i]), float(dep + st_elev[i]), phases[i])
-                    for i in range(len(obs))
-                ], dtype=float)
+                    tt = np.array([
+                        travel_time_layered(float(dist[i]), float(dep + st_elev[i]), phases[i])
+                        for i in range(len(obs))
+                    ], dtype=float)
+
+                    t_origin = np.median(t_obs - tt)
+                    res = (t_obs - (t_origin + tt))
+                    rms = float(np.sqrt(np.mean(res**2)))
+
+                    cand = (rms, float(lat), float(lon), dep, float(t_origin))
+
+                    if len(bests) < COARSE_TOPK:
+                        heapq.heappush(bests, (-cand[0], cand))
+                    else:
+                        if cand[0] < (-bests[0][0]):
+                            heapq.heapreplace(bests, (-cand[0], cand))
+
+                    k += 1
+                    if SHOW_GRID_PROGRESS and (k % GRID_PROGRESS_EVERY) == 0:
+                        best_rms = min(c[0] for _, c in bests) if bests else np.inf
+                        print(f"[{label}] {k}/{total} ({100.0*k/total:.1f}%) best_rms={best_rms:.2f}s", end="\r")
+
+        if SHOW_GRID_PROGRESS:
+            print(" " * 80, end="\r")
+
+        top = [c for _, c in bests]
+        top.sort(key=lambda x: x[0])
+        return top
 
 
 
-                # origin time por least squares: t_obs ≈ t_origin + tt
-                # => t_origin = median(t_obs - tt) (robusto)
-                t_origin = np.median(t_obs - tt)
+    # ---- COARSE ----
+    lats_c = np.arange(lat_min, lat_max + 1e-12, DLAT_C)
+    lons_c = np.arange(lon_min, lon_max + 1e-12, DLON_C)
 
-                res = (t_obs - (t_origin + tt))
-                rms = float(np.sqrt(np.mean(res**2)))
+    cands = eval_grid(lats_c, lons_c, DEPTHS_COARSE, label="coarse")
+    if not cands:
+        return None
 
-                if (best is None) or (rms < best[0]):
-                    best = (rms, float(lat), float(lon), dep, float(t_origin))
+    best_global = None
 
-    return best
+    for ic, (rms_c, lat_c, lon_c, dep_c, torig_c) in enumerate(cands, start=1):
+
+        lat0 = max(lat_min, lat_c - REFINE_HALFSPAN_DEG)
+        lat1 = min(lat_max, lat_c + REFINE_HALFSPAN_DEG)
+        lon0 = max(lon_min, lon_c - REFINE_HALFSPAN_DEG)
+        lon1 = min(lon_max, lon_c + REFINE_HALFSPAN_DEG)
+
+        lats_f = np.arange(lat0, lat1 + 1e-12, dlat)
+        lons_f = np.arange(lon0, lon1 + 1e-12, dlon)
+
+        fine_cands = eval_grid(lats_f, lons_f, depths_km, label=f"fine{ic}")
+        if fine_cands:
+            cand_f = fine_cands[0]  # el mejor fine en ese vecindario
+        else:
+            cand_f = (rms_c, lat_c, lon_c, dep_c, torig_c)
+
+        if (best_global is None) or (cand_f[0] < best_global[0]):
+            best_global = cand_f
+
+    return best_global
+
+
+
 
 
 def build_layer_tops(layers):
@@ -468,7 +526,7 @@ def match_loc_to_official(official_df: pd.DataFrame, loc_df: pd.DataFrame,
             dkm0 = haversine_km(r["lat"], r["lon"], rr0["lat"], rr0["lon"])
             dz0  = abs(float(r["depth_km"]) - float(rr0["depth_km"]))
             dt0  = float(loc_t[j0] - t_off)
-
+            
             out_rows.append({
                 "idx_official": i,
                 "is_match": False,
@@ -477,6 +535,11 @@ def match_loc_to_official(official_df: pd.DataFrame, loc_df: pd.DataFrame,
                 "ddep_km": float(dz0),
                 "event_idx": int(rr0["event_idx"]),
                 "score": np.nan,
+                "t0_official": r["t0"],
+                "lat_off": float(r["lat"]),
+                "lon_off": float(r["lon"]),
+                "dep_off": float(r["depth_km"]),
+
             })
         else:
             out_rows.append(best)
@@ -588,8 +651,12 @@ def main():
     print("\n=== MATCH LOCALIZADO vs OFICIAL (solo matches) ===")
     print(m_ok.sort_values("score").to_string(index=False))
 
-    print("\n=== NO MATCH (idx_official) ===")
-    print(m_bad["idx_official"].to_list())
+    print("\n=== NO MATCH (detalle) ===")
+    print(m_bad.to_string(index=False))
+    print("shape:", m_bad.shape)
+    print("cols:", list(m_bad.columns))
+
+
 
 
     #print(f"💾 Localizaciones guardadas: {OUT_EVENTS_LOC_CSV}  (ok={loc_df['ok'].sum()}/{len(loc_df)})")
