@@ -287,14 +287,19 @@ def haversine_km(lat1, lon1, lat2, lon2):
     a = np.sin(dlat/2)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
     return 2*R*np.arcsin(np.sqrt(a))
 
-def picks_for_event(picks: pd.DataFrame, t0: float, phase: str, w: tuple[float,float]) -> pd.DataFrame:
+def picks_for_event(picks, t0, phase, w, topk_per_sta=2, min_prob=0.0):
     w0, w1 = w
-    d = picks[(picks["phase"] == phase) & (picks["t"] >= t0 + w0) & (picks["t"] <= t0 + w1)].copy()
+    d = picks[(picks["phase"] == phase) &
+              (picks["t"] >= t0 + w0) &
+              (picks["t"] <= t0 + w1) &
+              (picks["prob"] >= min_prob)].copy()
     if d.empty:
         return d
-    # 1 pick por estación: el de mayor prob (más robusto que "primero")
-    d = d.sort_values("prob", ascending=False).drop_duplicates("station", keep="first")
+    d = d.sort_values(["station","prob"], ascending=[True, False])
+    d["rk"] = d.groupby("station").cumcount()
+    d = d[d["rk"] < topk_per_sta].drop(columns=["rk"])
     return d
+
 
 
 def travel_time_layered(dist_km: float, depth_km: float, phase: str) -> float:
@@ -385,9 +390,9 @@ def locate_event_grid(pP, pS, stations,
 
                     t_origin = np.median(t_obs - tt)
                     res = (t_obs - (t_origin + tt))
-                    rms = float(np.sqrt(np.mean(res**2)))
+                    score = np.median(np.abs(res))   # L1 robusto
 
-                    cand = (rms, float(lat), float(lon), dep, float(t_origin))
+                    cand = (score, float(lat), float(lon), dep, float(t_origin))
 
                     if len(bests) < COARSE_TOPK:
                         heapq.heappush(bests, (-cand[0], cand))
