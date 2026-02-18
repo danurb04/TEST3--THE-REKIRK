@@ -167,48 +167,6 @@ def build_events_sliding_window(picksP, win_sec, min_stations, dead_sec, strong_
     return pd.DataFrame(events).sort_values("t0").reset_index(drop=True)
 
 
-    if picksP.empty:
-        return pd.DataFrame(columns=["t0","t0_utc","n_stations","n_picks","maxprob","meanprob","n_strong"])
-    p = picksP.sort_values("t").reset_index(drop=True)
-    events = []
-    i = 0
-    n = len(p)
-
-    while i < n:
-        t_start = float(p.loc[i, "t"])
-        t_end = t_start + win_sec
-        w = p[(p["t"] >= t_start) & (p["t"] <= t_end)]
-        nsta = w["station"].nunique()
-        if nsta >= min_stations:
-            # 1 pick por estación (el primero en tiempo dentro de la ventana)
-            per_sta = w.sort_values("t").drop_duplicates("station", keep="first")
-
-            maxprob = float(per_sta["prob"].max())
-            meanprob = float(per_sta["prob"].mean())
-            n_strong = int((per_sta["prob"] >= strong_thr).sum())
-
-            # tiempo representativo del evento: cuantil 0.25 de picks por estación
-            t0 = float(np.median(per_sta["t"].values))
-
-            events.append({
-                "t0": t0,
-                "t0_utc": pd.to_datetime(t0, unit="s"),
-                "n_stations": int(nsta),
-                "n_picks": int(len(w)),
-                "maxprob": maxprob,
-                "meanprob": meanprob,
-                "n_strong": n_strong,
-            })
-
-            block_until = t0 + dead_sec
-            while i < n and float(p.loc[i, "t"]) <= block_until:
-                i += 1
-        else:
-            i += 1
-
-    return pd.DataFrame(events).sort_values("t0").reset_index(drop=True)
-
-
 
 
 # =====================
@@ -490,8 +448,53 @@ def match_loc_to_official(official_df: pd.DataFrame, loc_df: pd.DataFrame,
         dt = np.abs(loc_t - t_off)
         cand_idx = np.where(dt <= t_tol)[0]
         if cand_idx.size == 0:
-            out_rows.append({"idx_official": i, "is_match": False, "score": np.nan})
+            # Diagnóstico: evento localizado más cercano en tiempo (aunque esté fuera de tolerancia)
+            if len(loc_t) > 0:
+                j_near = int(np.argmin(np.abs(loc_t - t_off)))
+                rrn = loc.iloc[j_near]
+                dt_near = float(loc_t[j_near] - t_off)
+                dkm_near = float(haversine_km(r["lat"], r["lon"], rrn["lat"], rrn["lon"]))
+                dz_near  = float(abs(float(r["depth_km"]) - float(rrn["depth_km"])))
+                t0_loc_near = rrn["t0"]
+                lat_loc_near = float(rrn["lat"])
+                lon_loc_near = float(rrn["lon"])
+                dep_loc_near = float(rrn["depth_km"])
+                event_idx_near = int(rrn["event_idx"])
+                rms_near = float(rrn.get("rms_sec", np.nan))
+            else:
+                j_near = None
+                dt_near = np.nan
+                dkm_near = np.nan
+                dz_near = np.nan
+                t0_loc_near = pd.NaT
+                lat_loc_near = np.nan
+                lon_loc_near = np.nan
+                dep_loc_near = np.nan
+                event_idx_near = np.nan
+                rms_near = np.nan
+
+            out_rows.append({
+                "idx_official": i,
+                "t0_official": r["t0"],
+                "lat_off": float(r["lat"]),
+                "lon_off": float(r["lon"]),
+                "dep_off": float(r["depth_km"]),
+                "is_match": False,
+                "score": np.nan,
+
+                # info del localizado más cercano (para debug)
+                "event_idx": event_idx_near,
+                "t0_loc": t0_loc_near,
+                "lat_loc": lat_loc_near,
+                "lon_loc": lon_loc_near,
+                "dep_loc": dep_loc_near,
+                "dt_sec": dt_near,
+                "dist_km": dkm_near,
+                "ddep_km": dz_near,
+                "rms_sec": rms_near,
+            })
             continue
+
 
         best = None
         for j in cand_idx:
