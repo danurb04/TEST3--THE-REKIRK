@@ -74,8 +74,28 @@ DLAT_C = 0.05
 DLON_C = 0.05
 DEPTHS_COARSE = [3, 8, 15]
 COARSE_TOPK = 8
-# Fine search alrededor del mejor coarse
-REFINE_HALFSPAN_DEG = 0.06   # +/- grados alrededor del coarse best
+
+# --- NUEVO: cuántos coarse candidates refinamos en Fine-1 ---
+N_FINE1_FROM_COARSE = 2   # <-- clave: de 8 fines bajas a 2
+
+# Fine-1: resolución "normal" en una zona mediana
+REFINE1_HALFSPAN_DEG = 0.06
+DLAT_F1 = 0.01
+DLON_F1 = 0.01
+
+# Fine depth alrededor del dep coarse (para Fine-1)
+DEPTH_FINE_HALFSPAN_KM = 8.0
+DEPTH_FINE_DZ_KM = 0.5
+
+# Fine-2: alta resolución en zona pequeña (1 sola vez)
+REFINE2_HALFSPAN_DEG = 0.01
+DLAT_F2 = 0.002
+DLON_F2 = 0.002
+
+# Fine-2 depth más apretado
+DEPTH2_HALFSPAN_KM = 2.0
+DEPTH2_DZ_KM = 0.25
+
 
 # Parámetros para imprimir progreso 
 PRINT_EVERY = 1          # imprime cada N eventos (1 = todos)
@@ -380,28 +400,62 @@ def locate_event_grid(pP, pS, stations,
     if not cands:
         return None
 
-    best_global = None
+    # --- SOLO LOS N MEJORES COARSE para Fine-1 ---
+    cands = cands[:N_FINE1_FROM_COARSE]
 
+    best_f1 = None  # mejor candidato después de Fine-1
+
+    # =========================
+    # Fine-1: solo N candidatos
+    # =========================
     for ic, (rms_c, lat_c, lon_c, dep_c, torig_c) in enumerate(cands, start=1):
 
-        lat0 = max(lat_min, lat_c - REFINE_HALFSPAN_DEG)
-        lat1 = min(lat_max, lat_c + REFINE_HALFSPAN_DEG)
-        lon0 = max(lon_min, lon_c - REFINE_HALFSPAN_DEG)
-        lon1 = min(lon_max, lon_c + REFINE_HALFSPAN_DEG)
+        lat0 = max(lat_min, lat_c - REFINE1_HALFSPAN_DEG)
+        lat1 = min(lat_max, lat_c + REFINE1_HALFSPAN_DEG)
+        lon0 = max(lon_min, lon_c - REFINE1_HALFSPAN_DEG)
+        lon1 = min(lon_max, lon_c + REFINE1_HALFSPAN_DEG)
 
-        lats_f = np.arange(lat0, lat1 + 1e-12, dlat)
-        lons_f = np.arange(lon0, lon1 + 1e-12, dlon)
+        # depths fine alrededor del depth coarse
+        z0 = max(0.5, float(dep_c) - DEPTH_FINE_HALFSPAN_KM)
+        z1 = float(dep_c) + DEPTH_FINE_HALFSPAN_KM
+        depths_f1 = np.arange(z0, z1 + 1e-12, DEPTH_FINE_DZ_KM)
 
-        fine_cands = eval_grid(lats_f, lons_f, depths_km, label=f"fine{ic}")
-        if fine_cands:
-            cand_f = fine_cands[0]  # el mejor fine en ese vecindario
-        else:
-            cand_f = (rms_c, lat_c, lon_c, dep_c, torig_c)
+        lats_f1 = np.arange(lat0, lat1 + 1e-12, DLAT_F1)
+        lons_f1 = np.arange(lon0, lon1 + 1e-12, DLON_F1)
 
-        if (best_global is None) or (cand_f[0] < best_global[0]):
-            best_global = cand_f
+        fine1 = eval_grid(lats_f1, lons_f1, depths_f1, label=f"fine1_{ic}")
 
-    return best_global
+        cand_f1 = fine1[0] if fine1 else (rms_c, lat_c, lon_c, dep_c, torig_c)
+
+        if (best_f1 is None) or (cand_f1[0] < best_f1[0]):
+            best_f1 = cand_f1
+
+    # =========================
+    # Fine-2: 1 sola vez (alta res)
+    # =========================
+    if best_f1 is None:
+        return None
+
+    s1, lat_b, lon_b, dep_b, tor_b = best_f1
+
+    lat0 = max(lat_min, lat_b - REFINE2_HALFSPAN_DEG)
+    lat1 = min(lat_max, lat_b + REFINE2_HALFSPAN_DEG)
+    lon0 = max(lon_min, lon_b - REFINE2_HALFSPAN_DEG)
+    lon1 = min(lon_max, lon_b + REFINE2_HALFSPAN_DEG)
+
+    lats_f2 = np.arange(lat0, lat1 + 1e-12, DLAT_F2)
+    lons_f2 = np.arange(lon0, lon1 + 1e-12, DLON_F2)
+
+    z0 = max(0.5, float(dep_b) - DEPTH2_HALFSPAN_KM)
+    z1 = float(dep_b) + DEPTH2_HALFSPAN_KM
+    depths_f2 = np.arange(z0, z1 + 1e-12, DEPTH2_DZ_KM)
+
+    fine2 = eval_grid(lats_f2, lons_f2, depths_f2, label="fine2")
+
+    if fine2:
+        return fine2[0]
+    else:
+        return best_f1
 
 
 
@@ -607,13 +661,18 @@ def main():
     for idx, ev in events_loc.iterrows():
         t0 = float(ev["t0"])
         t_event_start = time.time()
-        if (idx % PRINT_EVERY) == 0:
-           print(f"\n[LOC] evento {idx+1}/{len(events_loc)}  t0={pd.to_datetime(t0, unit='s')}  nsta={int(ev['n_stations'])}  det={int(ev['det_support'])}  S={int(ev['S_support'])}")
+
 
         
 
         pP = picks_for_event(picks, t0, "P", P_WIN)
         pS = picks_for_event(picks, t0, "S", S_WIN)
+        nsta = int(ev["n_stations"])
+        nP = int(pP["station"].nunique()) if not pP.empty else 0
+        nS = int(pS["station"].nunique()) if not pS.empty else 0
+        if (idx % PRINT_EVERY) == 0:
+            print(f"\n[LOC] evento {idx+1}/{len(events_loc)}  t0={pd.to_datetime(t0, unit='s')}  nsta={nsta}  nP={nP}  nS={nS}  det={int(ev['det_support'])}  Ssupp={int(ev['S_support'])}")
+
 
         sol = locate_event_grid(pP, pS, stations)
         if sol is None:
@@ -629,7 +688,8 @@ def main():
             continue
 
         rms, lat, lon, dep, torigin = sol
-        print(f"[LOC]   -> OK  rms={rms:.2f}s  lat={lat:.3f} lon={lon:.3f} z={dep:.1f}km  nP={len(pP)} nS={len(pS)}  dt={time.time()-t_event_start:.1f}s")
+        print(f"[LOC]   -> OK  medAbs={rms:.3f}s  lat={lat:.3f} lon={lon:.3f} z={dep:.1f}km  nsta={nsta} nPsta={nP} nSsta={nS}  dt={time.time()-t_event_start:.1f}s")
+
         rows.append({
             "event_idx": int(idx),
             "t0_seed": pd.to_datetime(t0, unit="s"),
@@ -664,6 +724,8 @@ def main():
     print("shape:", m_bad.shape)
     print("cols:", list(m_bad.columns))
 
+    print("median dist km:", m_ok["dist_km"].median())
+    print("p90 dist km:", m_ok["dist_km"].quantile(0.9))
 
 
 
