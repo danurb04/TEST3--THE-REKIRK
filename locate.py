@@ -1,4 +1,3 @@
-from cProfile import label
 import time
 from pathlib import Path
 import numpy as np
@@ -14,12 +13,11 @@ JSTR = f"{YEAR}{JDAY:03d}"
 # Entradas 
 PICKS_CSV = f"picks_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"
 DETECTIONS_CSV = f"detections_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"  # opcional (si existe)
-NODES_XLSX = "XML_Cartago_Nodes.xlsx"  # code,longitude,latitude,elevation,site
+NODES_CSV = "XML_Cartago_Nodes.csv"
 OUT_EVENTS_LOC_CSV = f"events_loc_{JSTR}.csv" # eventos localizados tras filtrado
 
 # Catalogo Oficial
-OFFICIAL_XLSX = "catalogo_oficial.xlsx"
-OFFICIAL_SHEET = 0
+OFFICIAL_CSV = "catalogo_oficial.csv"
 
 # Tolerancia para match entre eventos IA y oficiales 
 T_TOL = 15.0      # segundos
@@ -103,22 +101,27 @@ SHOW_GRID_PROGRESS = True
 GRID_PROGRESS_EVERY = 20000   # cada cuántas celdas del grid imprime avance (fine/coarse)
 
 # Carga catalogo oficial
-def load_official_day(xlsx_path, sheet, day_yyyymmdd):
-    df = pd.read_excel(xlsx_path, sheet_name=sheet)
-    # "date", "time", "lat", "lon", "depth_km", "mag"
+def load_official_day(csv_path, day_yyyymmdd):
+    df = pd.read_csv(csv_path)
+
+    # filtra por día
     df = df[df["date"] == int(day_yyyymmdd)].copy()
+
     # HHMMSScc (HH=hora, MM=minuto, SS=segundo, cc=centisegundo)
     ts = df["time"].astype("Int64").astype(str).str.zfill(8)
     hh = ts.str.slice(0, 2).astype(int)
     mm = ts.str.slice(2, 4).astype(int)
     ss = ts.str.slice(4, 6).astype(int)
     cc = ts.str.slice(6, 8).astype(int)
-    # construye base datetime (a segundos) + centiseconds*10ms
+
     date_str = df["date"].astype("Int64").astype(str)
-    base = pd.to_datetime(date_str + " " + hh.astype(str).str.zfill(2) + ":" +
-                          mm.astype(str).str.zfill(2) + ":" +
-                          ss.astype(str).str.zfill(2),
-                          format="%Y%m%d %H:%M:%S", errors="raise")
+    base = pd.to_datetime(
+        date_str + " " + hh.astype(str).str.zfill(2) + ":" +
+        mm.astype(str).str.zfill(2) + ":" +
+        ss.astype(str).str.zfill(2),
+        format="%Y%m%d %H:%M:%S",
+        errors="raise"
+    )
     df["t0_utc"] = base + pd.to_timedelta(cc * 10, unit="ms")
     df = df.sort_values("t0_utc").reset_index(drop=True)
     return df
@@ -232,12 +235,8 @@ def count_phase_support(picks, t0, phase, w0, w1):
 # Funciones para Localización por grid search
 #====================
 def load_station_nodes(path):
-    if str(path).lower().endswith((".xlsx", ".xls")):
-        df = pd.read_excel(path)
-    else:
-        df = pd.read_csv(path)
+    df = pd.read_csv(path)
 
-    # columnas tal como vienen: code, longitude, latitude, elevation
     df = df.rename(columns={
         "code": "station",
         "longitude": "lon",
@@ -245,7 +244,6 @@ def load_station_nodes(path):
         "elevation": "elev_m"
     })
 
-    # limpiar tipos
     df["station"] = df["station"].astype(str).str.strip()
     df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
     df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
@@ -611,7 +609,7 @@ def match_loc_to_official(official_df: pd.DataFrame, loc_df: pd.DataFrame,
 def main():
     t_start = time.time() # inicio medicion tiempo de ejecucion
 
-    official = load_official_day(OFFICIAL_XLSX, OFFICIAL_SHEET, OFFICIAL_DAY) # carga catalogo oficial
+    official = load_official_day(OFFICIAL_CSV, OFFICIAL_DAY)
     print(f"Oficial {OFFICIAL_DAY}: {len(official)} eventos")
 
     raw_picks = pd.read_csv(PICKS_CSV) # carga picks
@@ -654,7 +652,7 @@ def main():
         f"\nEventos tras filtrado: {len(events_loc)} "
     )
     
-    stations = load_station_nodes(NODES_XLSX).set_index("station")
+    stations = load_station_nodes(NODES_CSV).set_index("station")
     print(f"Estaciones cargadas: {len(stations)}")
 
     rows = []
