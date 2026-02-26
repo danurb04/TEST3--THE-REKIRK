@@ -3,6 +3,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import heapq
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Configuracion temporal
 YEAR = 2024
@@ -100,7 +102,7 @@ DEPTH2_DZ_KM = 0.25
 
 
 # Parámetros para imprimir progreso 
-PRINT_EVERY = 1          # imprime cada N eventos (1 = todos)
+PRINT_EVERY = 999999         # imprime cada N eventos (1 = todos)
 SHOW_GRID_PROGRESS = True
 GRID_PROGRESS_EVERY = 20000   # cada cuántas celdas del grid imprime avance (fine/coarse)
 
@@ -610,6 +612,62 @@ def match_loc_to_official(official_df: pd.DataFrame, loc_df: pd.DataFrame,
 
     return pd.DataFrame(out_rows)
 
+def _locate_one_event(idx, ev_row):
+    global _G_PICKS, _G_STATIONS
+
+    t0 = float(ev_row["t0"])
+    picks = _G_PICKS
+    stations = _G_STATIONS
+
+    pP = picks_for_event(picks, t0, "P", P_WIN)
+    pS = picks_for_event(picks, t0, "S", S_WIN)
+
+    nsta = int(ev_row["n_stations"])
+    nP = int(pP["station"].nunique()) if not pP.empty else 0
+    nS = int(pS["station"].nunique()) if not pS.empty else 0
+
+    sol = locate_event_grid(pP, pS, stations)
+
+    if sol is None:
+        return {
+            "event_idx": int(idx),
+            "t0_seed": pd.to_datetime(t0, unit="s"),
+            "ok": False,
+            "nP": int(len(pP)),
+            "nS": int(len(pS)),
+            "nsta_event": nsta,
+            "det_support": int(ev_row.get("det_support", 0)),
+            "S_support": int(ev_row.get("S_support", 0)),
+        }
+
+    rms, lat, lon, dep, torigin = sol
+    return {
+        "event_idx": int(idx),
+        "t0_seed": pd.to_datetime(t0, unit="s"),
+        "origin_time_utc": pd.to_datetime(torigin, unit="s"),
+        "lat": float(lat),
+        "lon": float(lon),
+        "depth_km": float(dep),
+        "rms_sec": float(rms),
+        "nP": int(len(pP)),
+        "nS": int(len(pS)),
+        "nsta_event": nsta,
+        "maxprob": float(ev_row["maxprob"]),
+        "det_support": int(ev_row["det_support"]),
+        "S_support": int(ev_row["S_support"]),
+        "ok": True,
+    }
+
+# Globals (se llenan 1 vez por proceso)
+_G_PICKS = None
+_G_STATIONS = None
+
+def _init_worker(picks, stations):
+    global _G_PICKS, _G_STATIONS
+    _G_PICKS = picks
+    _G_STATIONS = stations
+
+
 def main():
     t_start = time.time() # inicio medicion tiempo de ejecucion
 
@@ -656,61 +714,29 @@ def main():
         f"\nEventos tras filtrado: {len(events_loc)} "
     )
     
+    # stations indexado (como ya lo tenías)
     stations = load_station_nodes(NODES_CSV).set_index("station")
-    print(f"Estaciones cargadas: {len(stations)}")
+
+    # workers: usa SLURM_CPUS_PER_TASK si existe; si no, poné un número razonable
+    n_workers = 5
+    print("workers:", n_workers)
 
     rows = []
-    for idx, ev in events_loc.iterrows():
-        t0 = float(ev["t0"])
-        t_event_start = time.time()
 
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        initializer=_init_worker,
+        initargs=(picks, stations)
+    ) as ex:
+        futs = [ex.submit(_locate_one_event, idx, ev) for idx, ev in events_loc.iterrows()]
 
-        
+        for k, f in enumerate(as_completed(futs), start=1):
+            rows.append(f.result())
+            if k % 5 == 0:
+                print(f"locados {k}/{len(futs)}", end="\r")
 
-        pP = picks_for_event(picks, t0, "P", P_WIN)
-        pS = picks_for_event(picks, t0, "S", S_WIN)
-        nsta = int(ev["n_stations"])
-        nP = int(pP["station"].nunique()) if not pP.empty else 0
-        nS = int(pS["station"].nunique()) if not pS.empty else 0
-        if (idx % PRINT_EVERY) == 0:
-            print(f"\n[LOC] evento {idx+1}/{len(events_loc)}  t0={pd.to_datetime(t0, unit='s')}  nsta={nsta}  nP={nP}  nS={nS}  det={int(ev['det_support'])}  Ssupp={int(ev['S_support'])}")
-
-
-        sol = locate_event_grid(pP, pS, stations)
-        if sol is None:
-            print(f"[LOC]   -> FAIL (pocos picks)  nP={len(pP)} nS={len(pS)}  dt={time.time()-t_event_start:.1f}s")
-            rows.append({
-                "event_idx": int(idx),
-                "t0_seed": pd.to_datetime(t0, unit="s"),
-                "ok": False,
-                "nP": int(len(pP)),
-                "nS": int(len(pS)),
-            })
-            
-            continue
-
-        rms, lat, lon, dep, torigin = sol
-        print(f"[LOC]   -> OK  medAbs={rms:.3f}s  lat={lat:.3f} lon={lon:.3f} z={dep:.1f}km  nsta={nsta} nPsta={nP} nSsta={nS}  dt={time.time()-t_event_start:.1f}s")
-
-        rows.append({
-            "event_idx": int(idx),
-            "t0_seed": pd.to_datetime(t0, unit="s"),
-            "origin_time_utc": pd.to_datetime(torigin, unit="s"),
-            "lat": lat,
-            "lon": lon,
-            "depth_km": dep,
-            "rms_sec": rms,
-            "nP": int(len(pP)),
-            "nS": int(len(pS)),
-            "nsta_event": int(ev["n_stations"]),
-            "maxprob": float(ev["maxprob"]),
-            "det_support": int(ev["det_support"]),
-            "S_support": int(ev["S_support"]),
-            "ok": True,
-        })
-
-    loc_df = pd.DataFrame(rows).sort_values("origin_time_utc")
-    # loc_df.to_csv(OUT_EVENTS_LOC_CSV, index=False)
+    loc_df = pd.DataFrame(rows)
+    loc_df = loc_df.sort_values("origin_time_utc", na_position="last")
 
     # comparar con oficial si existe
     m = match_loc_to_official(official, loc_df)
