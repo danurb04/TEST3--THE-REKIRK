@@ -5,26 +5,12 @@ import pandas as pd
 import heapq
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, timedelta
+import argparse
 
 # Configuracion temporal
 YEAR = 2024
-JDAY = 190
-OFFICIAL_DAY = 20240708  # AJUSTAR al día real (yyyymmdd)
-JSTR = f"{YEAR}{JDAY:03d}"
 
-
-BASE_IN = Path("/data/murbina/seismo/inputs")
-
-OFFICIAL_CSV = BASE_IN / "catalogo_oficial.csv"
-NODES_CSV    = BASE_IN / "XML_Cartago_Nodes.csv"
-
-PICKS_CSV      = BASE_IN / f"picks_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"
-DETECTIONS_CSV = BASE_IN / f"detections_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"
-
-BASE_OUT = Path("/data/murbina/seismo/results")
-BASE_OUT.mkdir(parents=True, exist_ok=True)
-
-OUT_EVENTS_LOC_CSV = BASE_OUT / f"events_loc_{JSTR}.csv"
 # Tolerancia para match entre eventos IA y oficiales 
 T_TOL = 15.0      # segundos
 D_TOL_KM = 15.0   # km (ajústalo)
@@ -106,6 +92,11 @@ PRINT_EVERY = 999999         # imprime cada N eventos (1 = todos)
 SHOW_GRID_PROGRESS = True
 GRID_PROGRESS_EVERY = 20000   # cada cuántas celdas del grid imprime avance (fine/coarse)
 
+def build_jstr(year, jday):
+    return f"{year}{jday:03d}"
+def jday_to_yyyymmdd(year: int, jday: int) -> int:
+    d = datetime(year, 1, 1) + timedelta(days=jday - 1)
+    return int(d.strftime("%Y%m%d"))
 # Carga catalogo oficial
 def load_official_day(csv_path, day_yyyymmdd):
     df = pd.read_csv(csv_path)
@@ -668,7 +659,23 @@ def _init_worker(picks, stations):
     _G_STATIONS = stations
 
 
-def main():
+def main(jday):
+    t_start = time.time()
+    JSTR = build_jstr(YEAR, jday)
+
+    BASE_IN  = Path("/data/murbina/seismo/inputs")
+    BASE_OUT = Path("/data/murbina/seismo/results")
+    BASE_OUT.mkdir(parents=True, exist_ok=True)
+
+    PICKS_CSV      = BASE_IN / f"picks_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"
+    DETECTIONS_CSV = BASE_IN / f"detections_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"
+    NODES_CSV      = BASE_IN / "XML_Cartago_Nodes.csv"
+    OFFICIAL_CSV   = BASE_IN / "catalogo_oficial.csv"
+    OUT_EVENTS_LOC_CSV = BASE_OUT / f"events_loc_{JSTR}.csv"
+    OFFICIAL_DAY = jday_to_yyyymmdd(YEAR, jday)
+    JSTR = f"{YEAR}{jday:03d}"
+    print("JSTR:", JSTR, "OFFICIAL_DAY:", OFFICIAL_DAY)
+
     t_start = time.time() # inicio medicion tiempo de ejecucion
 
     official = load_official_day(OFFICIAL_CSV, OFFICIAL_DAY)
@@ -760,5 +767,11 @@ def main():
     print("Guardado:", OUT_EVENTS_LOC_CSV)
     #print(f"💾 Localizaciones guardadas: {OUT_EVENTS_LOC_CSV}  (ok={loc_df['ok'].sum()}/{len(loc_df)})")
     print(f"\n⏱ Total: {time.time() - t_start:.1f}s")
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--jday", type=int, required=True)
+    args = ap.parse_args()
+    main(args.jday)
 
 loc_df, m_ok, m_bad = main()
