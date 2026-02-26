@@ -10,15 +10,19 @@ JDAY = 190
 OFFICIAL_DAY = 20240708  # AJUSTAR al día real (yyyymmdd)
 JSTR = f"{YEAR}{JDAY:03d}"
 
-# Entradas 
-PICKS_CSV = f"picks_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"
-DETECTIONS_CSV = f"detections_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"  # opcional (si existe)
-NODES_CSV = "XML_Cartago_Nodes.csv"
-OUT_EVENTS_LOC_CSV = f"events_loc_{JSTR}.csv" # eventos localizados tras filtrado
 
-# Catalogo Oficial
-OFFICIAL_CSV = "catalogo_oficial.csv"
+BASE_IN = Path("/data/murbina/seismo/inputs")
 
+OFFICIAL_CSV = BASE_IN / "catalogo_oficial.csv"
+NODES_CSV    = BASE_IN / "XML_Cartago_Nodes.csv"
+
+PICKS_CSV      = BASE_IN / f"picks_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"
+DETECTIONS_CSV = BASE_IN / f"detections_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"
+
+BASE_OUT = Path("/data/murbina/seismo/results")
+BASE_OUT.mkdir(parents=True, exist_ok=True)
+
+OUT_EVENTS_LOC_CSV = BASE_OUT / f"events_loc_{JSTR}.csv"
 # Tolerancia para match entre eventos IA y oficiales 
 T_TOL = 15.0      # segundos
 D_TOL_KM = 15.0   # km (ajústalo)
@@ -726,10 +730,9 @@ def main():
     print("p90 dist km:", m_ok["dist_km"].quantile(0.9))
 
 
-
+    loc_df.to_csv(OUT_EVENTS_LOC_CSV, index=False)
+    print("Guardado:", OUT_EVENTS_LOC_CSV)
     #print(f"💾 Localizaciones guardadas: {OUT_EVENTS_LOC_CSV}  (ok={loc_df['ok'].sum()}/{len(loc_df)})")
     print(f"\n⏱ Total: {time.time() - t_start:.1f}s")
 
-
-if __name__ == "__main__":
-    main()
+loc_df, m_ok, m_bad = main()
