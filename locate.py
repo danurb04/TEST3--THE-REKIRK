@@ -5,30 +5,45 @@ import pandas as pd
 import heapq
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime, timedelta
-import argparse
 
 # Configuracion temporal
 YEAR = 2024
+JDAY = 190
+OFFICIAL_DAY = 20240708  # AJUSTAR al día real (yyyymmdd)
+JSTR = f"{YEAR}{JDAY:03d}"
 
+
+BASE_IN = Path("/data/murbina/seismo/inputs")
+
+#OFFICIAL_CSV = BASE_IN / "catalogo_oficial.csv"
+OFFICIAL_CSV = BASE_IN / "catalogo_completo_190.csv"
+NODES_CSV    = BASE_IN / "XML_Cartago_Nodes.csv"
+
+PICKS_CSV      = BASE_IN / f"picks_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"
+DETECTIONS_CSV = BASE_IN / f"detections_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"
+
+BASE_OUT = Path("/data/murbina/seismo/results")
+BASE_OUT.mkdir(parents=True, exist_ok=True)
+
+OUT_EVENTS_LOC_CSV = BASE_OUT / f"events_loc_{JSTR}.csv"
 # Tolerancia para match entre eventos IA y oficiales 
 T_TOL = 15.0      # segundos
 D_TOL_KM = 15.0   # km (ajústalo)
 Z_TOL_KM = 10.0   # km (ajústalo)
 
 # Parámetros para construir eventos
-BIN_SEC = 8.0 # agrupa picks en este tiempo (en una misma estacion) para quedarse con el más fuerte 
+BIN_SEC = 3.0 # agrupa picks en este tiempo (en una misma estacion) para quedarse con el más fuerte 
 WIN_SEC = 30.0 # tamaño de ventana para agrupar picks P entre estaciones 
-MIN_STATIONS = 4 # mínimo de estaciones con picks P para considerar un evento
-DEAD_SEC = 18.0 # tiempo mínimo entre eventos 
+MIN_STATIONS = 3 # mínimo de estaciones con picks P para considerar un evento
+DEAD_SEC = 5.0 # tiempo mínimo entre eventos 
 
 # Parametros para filtrar eventos 
 STRONG_THR = 0.75 # umbral de probabilidad para considerar un pick como “fuerte” 
-F_MIN_STATIONS = 7 # mínimo de estaciones con picks P 
+F_MIN_STATIONS = 5 # mínimo de estaciones con picks P 
 F_MAXPROB = 0.85 # probabilidad máxima necesaria de una estación para considerar un evento 
-F_MIN_STRONG = 5 # mínimo de estaciones con picks P fuertes para un mismo evento
-F_MIN_DET_SUPPORT = 50  # mínimo de detecciones (no picks) dentro de un evento para considerarlo 
-F_MIN_S_SUPPORT = 10 # mínimo de picks S dentro de un evento para considerarlo
+F_MIN_STRONG = 4 # mínimo de estaciones con picks P fuertes para un mismo evento
+F_MIN_DET_SUPPORT = 45  # mínimo de detecciones (no picks) dentro de un evento para considerarlo 
+F_MIN_S_SUPPORT = 8 # mínimo de picks S dentro de un evento para considerarlo
 
 # Ventana para asignar picks al evento
 P_WIN = (-5.0, 10.0)   # seconds relative to t0
@@ -92,11 +107,6 @@ PRINT_EVERY = 999999         # imprime cada N eventos (1 = todos)
 SHOW_GRID_PROGRESS = True
 GRID_PROGRESS_EVERY = 20000   # cada cuántas celdas del grid imprime avance (fine/coarse)
 
-def build_jstr(year, jday):
-    return f"{year}{jday:03d}"
-def jday_to_yyyymmdd(year: int, jday: int) -> int:
-    d = datetime(year, 1, 1) + timedelta(days=jday - 1)
-    return int(d.strftime("%Y%m%d"))
 # Carga catalogo oficial
 def load_official_day(csv_path, day_yyyymmdd):
     df = pd.read_csv(csv_path)
@@ -659,23 +669,7 @@ def _init_worker(picks, stations):
     _G_STATIONS = stations
 
 
-def main(jday):
-    t_start = time.time()
-    JSTR = build_jstr(YEAR, jday)
-
-    BASE_IN  = Path("/data/murbina/seismo/inputs")
-    BASE_OUT = Path("/data/murbina/seismo/results")
-    BASE_OUT.mkdir(parents=True, exist_ok=True)
-
-    PICKS_CSV      = BASE_IN / f"picks_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"
-    DETECTIONS_CSV = BASE_IN / f"detections_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"
-    NODES_CSV      = BASE_IN / "XML_Cartago_Nodes.csv"
-    OFFICIAL_CSV   = BASE_IN / "catalogo_oficial.csv"
-    OUT_EVENTS_LOC_CSV = BASE_OUT / f"events_loc_{JSTR}.csv"
-    OFFICIAL_DAY = jday_to_yyyymmdd(YEAR, jday)
-    JSTR = f"{YEAR}{jday:03d}"
-    print("JSTR:", JSTR, "OFFICIAL_DAY:", OFFICIAL_DAY)
-
+def main():
     t_start = time.time() # inicio medicion tiempo de ejecucion
 
     official = load_official_day(OFFICIAL_CSV, OFFICIAL_DAY)
@@ -761,17 +755,13 @@ def main(jday):
 
     print("median dist km:", m_ok["dist_km"].median())
     print("p90 dist km:", m_ok["dist_km"].quantile(0.9))
-
+    print(f"\nTotal oficiales: {len(m)}")
+    print(f"Eventos con match: {len(m_ok)}")
+    print(f"Eventos sin match: {len(m_bad)}")
 
     loc_df.to_csv(OUT_EVENTS_LOC_CSV, index=False)
     print("Guardado:", OUT_EVENTS_LOC_CSV)
     #print(f"💾 Localizaciones guardadas: {OUT_EVENTS_LOC_CSV}  (ok={loc_df['ok'].sum()}/{len(loc_df)})")
     print(f"\n⏱ Total: {time.time() - t_start:.1f}s")
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--jday", type=int, required=True)
-    args = ap.parse_args()
-    main(args.jday)
 
 loc_df, m_ok, m_bad = main()
