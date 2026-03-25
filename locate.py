@@ -8,15 +8,15 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Configuracion temporal
 YEAR = 2024
-JDAY = 190
-OFFICIAL_DAY = 20240708  # AJUSTAR al día real (yyyymmdd)
+JDAY = 189
+OFFICIAL_DAY = 20240707  # AJUSTAR al día real (yyyymmdd)
 JSTR = f"{YEAR}{JDAY:03d}"
 
 
 BASE_IN = Path("/data/murbina/seismo/inputs")
 
 #OFFICIAL_CSV = BASE_IN / "catalogo_oficial.csv"
-OFFICIAL_CSV = BASE_IN / "catalogo_completo_190.csv"
+OFFICIAL_CSV = BASE_IN / "catalogo_nacional_189.csv"
 NODES_CSV    = BASE_IN / "XML_Cartago_Nodes.csv"
 
 PICKS_CSV      = BASE_IN / f"picks_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"
@@ -42,7 +42,7 @@ STRONG_THR = 0.75 # umbral de probabilidad para considerar un pick como “fuert
 F_MIN_STATIONS = 5 # mínimo de estaciones con picks P 
 F_MAXPROB = 0.85 # probabilidad máxima necesaria de una estación para considerar un evento 
 F_MIN_STRONG = 4 # mínimo de estaciones con picks P fuertes para un mismo evento
-F_MIN_DET_SUPPORT = 45  # mínimo de detecciones (no picks) dentro de un evento para considerarlo 
+F_MIN_DET_SUPPORT = 47  # mínimo de detecciones (no picks) dentro de un evento para considerarlo 
 F_MIN_S_SUPPORT = 8 # mínimo de picks S dentro de un evento para considerarlo
 
 # Ventana para asignar picks al evento
@@ -107,6 +107,21 @@ PRINT_EVERY = 999999         # imprime cada N eventos (1 = todos)
 SHOW_GRID_PROGRESS = True
 GRID_PROGRESS_EVERY = 20000   # cada cuántas celdas del grid imprime avance (fine/coarse)
 
+# --- Doble Diferencia settings ---
+
+DD_PHASE = "P"
+DD_MAX_PAIR_DIST_KM = 30.0     # eventos vecinos
+DD_MAX_PAIR_DT_SEC  = 900.0    # opcional: 5 min
+DD_MIN_COMMON_STA    = 3       # estaciones P en común
+DD_K_NEIGHBORS       = 30      # vecinos por evento (reduce costo)
+
+DD_ITERS = 5
+DD_DAMP = 0.3                  # damping (regularización) para estabilidad
+DD_STEP_LAT = 0.002            # deg (para derivadas finitas)
+DD_STEP_LON = 0.002            # deg
+DD_STEP_Z   = 0.5              # km
+
+DD_ADJUST_DEPTH = False        # <-- por ahora NO ajustar z
 # Carga catalogo oficial
 def load_official_day(csv_path, day_yyyymmdd):
     df = pd.read_csv(csv_path)
@@ -658,7 +673,233 @@ def _locate_one_event(idx, ev_row):
         "S_support": int(ev_row["S_support"]),
         "ok": True,
     }
+def build_event_P_obs(picks: pd.DataFrame, loc_df: pd.DataFrame, p_win=(-5.0, 10.0), min_prob=0.0):
+    """
+    Devuelve dict: obs[event_idx][station] = t_pick_epoch_seconds
+    Usa ventana alrededor de t0_seed (si existe) o origin_time_utc.
+    """
+    obs = {}
+    for _, ev in loc_df.iterrows():
+        eid = int(ev["event_idx"])
+        if pd.notna(ev.get("t0_seed", pd.NaT)):
+            t0 = pd.to_datetime(ev["t0_seed"]).value / 1e9
+        else:
+            t0 = pd.to_datetime(ev["origin_time_utc"]).value / 1e9
 
+        w0, w1 = p_win
+        d = picks[(picks["phase"] == "P") &
+                  (picks["t"] >= t0 + w0) &
+                  (picks["t"] <= t0 + w1) &
+                  (picks["prob"] >= min_prob)].copy()
+        if d.empty:
+            obs[eid] = {}
+            continue
+
+        # 1 pick por estación: mayor prob
+        d = d.sort_values("prob", ascending=False).drop_duplicates("station", keep="first")
+        obs[eid] = dict(zip(d["station"].astype(str), d["t"].astype(float)))
+    return obs
+
+def build_event_pairs(loc_df: pd.DataFrame, max_dist_km=15.0, max_dt_sec=300.0, k_neighbors=10):
+    """
+    Retorna lista de pares (eid_i, eid_j).
+    """
+    ev = loc_df.copy()
+    ev = ev[ev["ok"] == True].copy()
+
+    ev["eid"] = ev["event_idx"].astype(int)
+    ev["t0"] = pd.to_datetime(ev["origin_time_utc"]).astype("int64") / 1e9
+
+    eids = ev["eid"].to_numpy()
+    lat = ev["lat"].to_numpy(dtype=float)
+    lon = ev["lon"].to_numpy(dtype=float)
+    t0  = ev["t0"].to_numpy(dtype=float)
+
+    pairs = set()
+    for a in range(len(eids)):
+        # distancia a todos (barato para ~70)
+        dkm = haversine_km(lat[a], lon[a], lat, lon)
+        dt  = np.abs(t0[a] - t0)
+
+        mask = (dkm <= max_dist_km) & (dt <= max_dt_sec) & (eids != eids[a])
+        cand_idx = np.where(mask)[0]
+        if cand_idx.size == 0:
+            continue
+
+        # toma los K más cercanos
+        cand_sorted = cand_idx[np.argsort(dkm[cand_idx])][:k_neighbors]
+        for b in cand_sorted:
+            i, j = int(eids[a]), int(eids[b])
+            if i == j:
+                continue
+            if i < j:
+                pairs.add((i, j))
+            else:
+                pairs.add((j, i))
+
+    return sorted(pairs)
+
+def tt_for_event_station(lat_e, lon_e, z_e, sta_lat, sta_lon, sta_elev_km, phase="P"):
+    dist = float(haversine_km(lat_e, lon_e, sta_lat, sta_lon))
+    return travel_time_layered(dist, float(z_e + sta_elev_km), phase)
+
+def finite_diff_partials(lat_e, lon_e, z_e, sta_lat, sta_lon, sta_elev_km, phase="P",
+                         dlat=0.002, dlon=0.002, dz=0.5):
+    tt0 = tt_for_event_station(lat_e, lon_e, z_e, sta_lat, sta_lon, sta_elev_km, phase)
+
+    tt_lat = tt_for_event_station(lat_e + dlat, lon_e, z_e, sta_lat, sta_lon, sta_elev_km, phase)
+    tt_lon = tt_for_event_station(lat_e, lon_e + dlon, z_e, sta_lat, sta_lon, sta_elev_km, phase)
+    dTT_dlat = (tt_lat - tt0) / dlat
+    dTT_dlon = (tt_lon - tt0) / dlon
+
+    tt_z = tt_for_event_station(lat_e, lon_e, z_e + dz, sta_lat, sta_lon, sta_elev_km, phase)
+    dTT_dz = (tt_z - tt0) / dz
+
+    return tt0, dTT_dlat, dTT_dlon, dTT_dz
+
+def run_dd_reloc(loc_df, obsP, stations, pairs,
+                 adjust_depth=False, min_common=6, iters=5, damp=0.3):
+
+    # Solo eventos ok
+    ev = loc_df[loc_df["ok"] == True].copy()
+    ev = ev.set_index("event_idx", drop=False)
+    eids = ev["event_idx"].astype(int).to_list()
+
+    ref_eid = eids[0]  # ancla
+    # mapea eid -> bloque de columnas
+    # params por evento: dlat, dlon, dt0 (+ dz opcional)
+    npar = 3 + (1 if adjust_depth else 0)
+
+    col0 = {}
+    c = 0
+    for eid in eids:
+        if eid == ref_eid:
+            continue
+        col0[eid] = c
+        c += npar
+    n_unknowns = c
+
+    # estado actual
+    lat = ev["lat"].astype(float).to_dict()
+    lon = ev["lon"].astype(float).to_dict()
+    z   = ev["depth_km"].astype(float).to_dict()
+    t0  = (pd.to_datetime(ev["origin_time_utc"]).astype("int64") / 1e9).to_dict()
+
+    # estaciones indexadas
+    st = stations.copy()
+    if "elev_km" not in st.columns:
+        st["elev_km"] = 0.0
+
+    for it in range(1, iters + 1):
+        rows = []
+        rhs  = []
+
+        used_eq = 0
+        for (i, j) in pairs:
+            oi = obsP.get(i, {})
+            oj = obsP.get(j, {})
+            common = set(oi.keys()) & set(oj.keys())
+            if len(common) < min_common:
+                continue
+
+            for sta in common:
+                if sta not in st.index:
+                    continue
+
+                # observado
+                dt_obs = float(oi[sta] - oj[sta])
+
+                # predicho
+                sta_lat = float(st.loc[sta, "lat"])
+                sta_lon = float(st.loc[sta, "lon"])
+                sta_el  = float(st.loc[sta, "elev_km"])
+
+                # TT + derivadas
+                tti, dti_lat, dti_lon, dti_z = finite_diff_partials(
+                    lat[i], lon[i], z[i], sta_lat, sta_lon, sta_el, "P",
+                    DD_STEP_LAT, DD_STEP_LON, DD_STEP_Z
+                )
+                ttj, dtj_lat, dtj_lon, dtj_z = finite_diff_partials(
+                    lat[j], lon[j], z[j], sta_lat, sta_lon, sta_el, "P",
+                    DD_STEP_LAT, DD_STEP_LON, DD_STEP_Z
+                )
+
+                dt_pred = (t0[i] - t0[j]) + (tti - ttj)
+                r = dt_obs - dt_pred  # queremos A x = r
+
+                # arma fila sparse en formato denso (para ~70 eventos sirve)
+                a = np.zeros(n_unknowns, dtype=float)
+
+                def add_event(eid, sgn, dTTlat, dTTlon, dTTz):
+                    # sgn = +1 para i, -1 para j (porque dd_pred usa +t0_i -t0_j, +TT_i - TT_j)
+                    if eid == ref_eid:
+                        return
+                    base = col0[eid]
+                    # dd_pred deriv wrt lat = dTT/dlat, etc.
+                    a[base + 0] += sgn * dTTlat
+                    a[base + 1] += sgn * dTTlon
+                    # dt0
+                    a[base + 2] += sgn * 1.0
+                    if adjust_depth:
+                        a[base + 3] += sgn * dTTz
+
+                add_event(i, +1.0, dti_lat, dti_lon, dti_z)
+                add_event(j, -1.0, dtj_lat, dtj_lon, dtj_z)
+
+                rows.append(a)
+                rhs.append(r)
+                used_eq += 1
+
+        if used_eq == 0:
+            print("[DD] sin ecuaciones (revisa min_common / pairs)")
+            break
+
+        A = np.vstack(rows)
+        b = np.array(rhs, dtype=float)
+
+        # damping: agrega pseudo-observaciones para mantener updates pequeños
+        # (damp * I) x = 0
+        A_d = np.sqrt(damp) * np.eye(n_unknowns)
+        b_d = np.zeros(n_unknowns)
+        A2 = np.vstack([A, A_d])
+        b2 = np.concatenate([b, b_d])
+
+        x, *_ = np.linalg.lstsq(A2, b2, rcond=None)
+
+        # aplica updates
+        max_d = 0.0
+        for eid in eids:
+            if eid == ref_eid:
+                continue
+            base = col0[eid]
+            dlat = x[base + 0]
+            dlon = x[base + 1]
+            dt0s = x[base + 2]
+            dz   = x[base + 3] if adjust_depth else 0.0
+
+            lat[eid] += dlat
+            lon[eid] += dlon
+            t0[eid]  += dt0s
+            if adjust_depth:
+                z[eid]   += dz
+
+            max_d = max(max_d, abs(dlat), abs(dlon), abs(dt0s), abs(dz))
+
+        # log simple
+        res = A.dot(x) - b
+        mad = np.median(np.abs(res - np.median(res)))
+        print(f"[DD] iter {it}/{iters}  eq={used_eq}  med|res|={np.median(np.abs(res)):.3f}s  MAD={mad:.3f}s  max_step={max_d:.3g}")
+
+    # arma salida
+    out = loc_df.copy()
+    mask = out["ok"] == True
+    out.loc[mask, "lat_dd"] = out.loc[mask, "event_idx"].map(lat)
+    out.loc[mask, "lon_dd"] = out.loc[mask, "event_idx"].map(lon)
+    out.loc[mask, "depth_km_dd"] = out.loc[mask, "event_idx"].map(z)
+    out.loc[mask, "origin_time_utc_dd"] = out.loc[mask, "event_idx"].map(lambda eid: pd.to_datetime(t0[int(eid)], unit="s"))
+
+    return out
+    
 # Globals (se llenan 1 vez por proceso)
 _G_PICKS = None
 _G_STATIONS = None
@@ -738,7 +979,51 @@ def main():
 
     loc_df = pd.DataFrame(rows)
     loc_df = loc_df.sort_values("origin_time_utc", na_position="last")
-
+    obsP = build_event_P_obs(picks, loc_df, p_win=P_WIN, min_prob=0.0)
+    # DEBUG: conteo de P por evento
+    pcounts = np.array([len(obsP.get(int(eid), {})) for eid in loc_df.loc[loc_df["ok"]==True, "event_idx"]], dtype=int)
+    print("[DD] P por evento (p25/med/p75):", np.percentile(pcounts, [25,50,75]))
+    print("[DD] eventos con <3 P:", int((pcounts < 3).sum()), "/", len(pcounts))
+    print("[DD] eventos con <6 P:", int((pcounts < 6).sum()), "/", len(pcounts))
+    pairs = build_event_pairs(
+        loc_df,
+        max_dist_km=DD_MAX_PAIR_DIST_KM,
+        max_dt_sec=DD_MAX_PAIR_DT_SEC,
+        k_neighbors=DD_K_NEIGHBORS
+    )
+    print("[DD] pares:", len(pairs))
+    commons = []
+    for (i, j) in pairs:
+        ci = set(obsP.get(i, {}).keys())
+        cj = set(obsP.get(j, {}).keys())
+        commons.append(len(ci & cj))
+    commons = np.array(commons, dtype=int) if commons else np.array([], dtype=int)
+    print("[DD] common P por par (min/p25/med/p75/max):",
+          (commons.min() if len(commons) else None,
+           np.percentile(commons, 25) if len(commons) else None,
+           np.percentile(commons, 50) if len(commons) else None,
+           np.percentile(commons, 75) if len(commons) else None,
+           commons.max() if len(commons) else None))
+    print("[DD] pares con >=6 comunes:", int((commons >= 6).sum()), "/", len(commons))
+    print("[DD] pares con >=3 comunes:", int((commons >= 3).sum()), "/", len(commons))
+    # --- DD relocation (P only) ---
+    obsP = build_event_P_obs(picks, loc_df, p_win=P_WIN, min_prob=0.0)
+    pairs = build_event_pairs(loc_df, DD_MAX_PAIR_DIST_KM, DD_MAX_PAIR_DT_SEC, DD_K_NEIGHBORS)
+    
+    print(f"[DD] pares: {len(pairs)}")
+    loc_dd = run_dd_reloc(
+        loc_df, obsP, stations,
+        pairs,
+        adjust_depth=DD_ADJUST_DEPTH,      # False por ahora
+        min_common=DD_MIN_COMMON_STA,
+        iters=DD_ITERS,
+        damp=DD_DAMP
+    )
+    
+    # guarda
+    out_dd = BASE_OUT / f"events_loc_dd_{JSTR}.csv"
+    loc_dd.to_csv(out_dd, index=False)
+    print("Guardado DD:", out_dd)
     # comparar con oficial si existe
     m = match_loc_to_official(official, loc_df)
     m_ok = m[m["is_match"] == True].copy()
