@@ -1,54 +1,57 @@
 import time
 from pathlib import Path
+from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import heapq
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
+# =====================
 # Configuracion temporal
+# =====================
 YEAR = 2024
-JDAY = 190
-OFFICIAL_DAY = 20240708  # AJUSTAR al día real (yyyymmdd)
-JSTR = f"{YEAR}{JDAY:03d}"
+JDAYS = [189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209]   # <- aquí pones 1 o varios días
 
-# Entradas 
-PICKS_CSV = f"picks_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"
-DETECTIONS_CSV = f"detections_day_{JSTR}_THP0.70_THS0.55_seisbench.csv"  # opcional (si existe)
-NODES_CSV = "XML_Cartago_Nodes.csv"
-OUT_EVENTS_LOC_CSV = f"events_loc_{JSTR}.csv" # eventos localizados tras filtrado
+BASE_IN = Path("/data/murbina/seismo/inputs")
 
-# Catalogo Oficial
-OFFICIAL_CSV = "catalogo_oficial.csv"
+# Solo picks y detections salen de results/picks
+BASE_PICKS = Path("/data/murbina/seismo/results/picks")
 
-# Tolerancia para match entre eventos IA y oficiales 
-T_TOL = 15.0      # segundos
-D_TOL_KM = 15.0   # km (ajústalo)
-Z_TOL_KM = 10.0   # km (ajústalo)
+NODES_CSV = BASE_IN / "XML_Cartago_Nodes.csv"
+
+BASE_OUT = Path("/data/murbina/seismo/results/catalogs/Test2")
+BASE_OUT.mkdir(parents=True, exist_ok=True)
+
+# Tolerancia para match entre eventos IA y oficiales
+T_TOL = 1.0
+D_TOL_KM = 15.0
+Z_TOL_KM = 10.0
 
 # Parámetros para construir eventos
 BIN_SEC = 8.0 # agrupa picks en este tiempo (en una misma estacion) para quedarse con el más fuerte 
 WIN_SEC = 30.0 # tamaño de ventana para agrupar picks P entre estaciones 
-MIN_STATIONS = 4 # mínimo de estaciones con picks P para considerar un evento
+MIN_STATIONS = 3 # mínimo de estaciones con picks P para considerar un evento
 DEAD_SEC = 18.0 # tiempo mínimo entre eventos 
 
 # Parametros para filtrar eventos 
 STRONG_THR = 0.75 # umbral de probabilidad para considerar un pick como “fuerte” 
 F_MIN_STATIONS = 7 # mínimo de estaciones con picks P 
 F_MAXPROB = 0.85 # probabilidad máxima necesaria de una estación para considerar un evento 
-F_MIN_STRONG = 5 # mínimo de estaciones con picks P fuertes para un mismo evento
-F_MIN_DET_SUPPORT = 50  # mínimo de detecciones (no picks) dentro de un evento para considerarlo 
+F_MIN_STRONG = 3 # mínimo de estaciones con picks P fuertes para un mismo evento
+F_MIN_DET_SUPPORT = 40  # mínimo de detecciones (no picks) dentro de un evento para considerarlo 
 F_MIN_S_SUPPORT = 10 # mínimo de picks S dentro de un evento para considerarlo
 
 # Ventana para asignar picks al evento
-P_WIN = (-5.0, 10.0)   # seconds relative to t0
+P_WIN = (-5.0, 10.0)
 S_WIN = (-3.0, 25.0)
 
-# Grid (ajústalo a Cartago / tu red)
-LAT_MIN, LAT_MAX, DLAT = 9.25, 10.12, 0.01 
+# Grid
+LAT_MIN, LAT_MAX, DLAT = 9.25, 10.12, 0.01
 LON_MIN, LON_MAX, DLON = -84.7, -83.16, 0.01
-DEPTHS_KM = [1, 3, 5, 8, 10, 15, 20] 
+DEPTHS_KM = [1, 3, 5, 8, 10, 15, 20]
 
-# Modelo 1D por capas (desde superficie, en km) ---
-# thickness_km, Vp, Vs
+# Modelo 1D por capas
 VEL_LAYERS = [
     (4.0,  4.45, 2.50),
     (2.0,  5.50, 3.00),
@@ -67,47 +70,66 @@ VEL_LAYERS = [
     (50.0, 8.40, 4.72),
 ]
 
-# Coarse grid (rápido)
+# Coarse grid
 DLAT_C = 0.05
 DLON_C = 0.05
 DEPTHS_COARSE = [3, 8, 15]
 COARSE_TOPK = 8
 
-# --- NUEVO: cuántos coarse candidates refinamos en Fine-1 ---
-N_FINE1_FROM_COARSE = 2   # <-- clave: de 8 fines bajas a 2
-
-# Fine-1: resolución "normal" en una zona mediana
+# Fine-1
+N_FINE1_FROM_COARSE = 2
 REFINE1_HALFSPAN_DEG = 0.06
 DLAT_F1 = 0.01
 DLON_F1 = 0.01
-
-# Fine depth alrededor del dep coarse (para Fine-1)
 DEPTH_FINE_HALFSPAN_KM = 8.0
 DEPTH_FINE_DZ_KM = 0.5
 
-# Fine-2: alta resolución en zona pequeña (1 sola vez)
+# Fine-2
 REFINE2_HALFSPAN_DEG = 0.01
 DLAT_F2 = 0.002
 DLON_F2 = 0.002
-
-# Fine-2 depth más apretado
 DEPTH2_HALFSPAN_KM = 2.0
 DEPTH2_DZ_KM = 0.25
 
-
-# Parámetros para imprimir progreso 
-PRINT_EVERY = 1          # imprime cada N eventos (1 = todos)
+# Progreso
+PRINT_EVERY = 999999
 SHOW_GRID_PROGRESS = True
-GRID_PROGRESS_EVERY = 20000   # cada cuántas celdas del grid imprime avance (fine/coarse)
+GRID_PROGRESS_EVERY = 20000
 
+
+# =====================
+# Helpers de rutas/fechas
+# =====================
+def jday_to_yyyymmdd(year, jday):
+    dt = datetime(year, 1, 1) + timedelta(days=jday - 1)
+    return int(dt.strftime("%Y%m%d"))
+
+def official_csv_for_day(jday):
+    # Si tu oficial es uno por día:
+    # Si en realidad usas un solo catálogo grande, cambia por:
+    return BASE_IN / "catalogo_oficial.csv"
+
+def picks_csv_for_day(year, jday):
+    jstr = f"{year}{jday:03d}"
+    return BASE_PICKS / f"picks_day_{jstr}_THP0.70_THS0.55_seisbench.csv"
+
+def detections_csv_for_day(year, jday):
+    jstr = f"{year}{jday:03d}"
+    return BASE_PICKS / f"detections_day_{jstr}_THP0.70_THS0.55_seisbench.csv"
+
+def out_events_loc_csv_for_day(year, jday):
+    jstr = f"{year}{jday:03d}"
+    return BASE_OUT / f"events_loc_{jstr}.csv"
+
+
+# =====================
 # Carga catalogo oficial
+# =====================
 def load_official_day(csv_path, day_yyyymmdd):
     df = pd.read_csv(csv_path)
 
-    # filtra por día
     df = df[df["date"] == int(day_yyyymmdd)].copy()
 
-    # HHMMSScc (HH=hora, MM=minuto, SS=segundo, cc=centisegundo)
     ts = df["time"].astype("Int64").astype(str).str.zfill(8)
     hh = ts.str.slice(0, 2).astype(int)
     mm = ts.str.slice(2, 4).astype(int)
@@ -127,8 +149,6 @@ def load_official_day(csv_path, day_yyyymmdd):
     return df
 
 
-
-
 # =====================
 # Event building
 # =====================
@@ -141,6 +161,7 @@ def normalize_eqt_picks(picks_df: pd.DataFrame) -> pd.DataFrame:
     df["t"] = df["t_pick"].astype("int64") / 1e9
     out = df[["station", "phase", "prob", "time_utc", "t"]].copy()
     return out.sort_values("t").reset_index(drop=True)
+
 def bin_best_pick_per_station(df, bin_sec, phase):
     d = df[df.phase == phase].copy()
     if d.empty:
@@ -148,6 +169,7 @@ def bin_best_pick_per_station(df, bin_sec, phase):
     d["bin"] = (d["t"] // bin_sec).astype(int)
     d = d.sort_values("prob", ascending=False).drop_duplicates(["station", "bin"])
     return d.drop(columns=["bin"]).sort_values("t").reset_index(drop=True)
+
 def build_events_sliding_window(picksP, win_sec, min_stations, dead_sec, strong_thr):
     if picksP.empty:
         return pd.DataFrame(columns=["t0","t0_utc","n_stations","n_picks","maxprob","meanprob","n_strong"])
@@ -161,14 +183,11 @@ def build_events_sliding_window(picksP, win_sec, min_stations, dead_sec, strong_
         w = p[(p["t"] >= t_start) & (p["t"] <= t_end)]
         nsta = w["station"].nunique()
         if nsta >= min_stations:
-            # 1 pick por estación (el primero en tiempo dentro de la ventana)
             per_sta = w.sort_values("t").drop_duplicates("station", keep="first")
 
             maxprob = float(per_sta["prob"].max())
             meanprob = float(per_sta["prob"].mean())
             n_strong = int((per_sta["prob"] >= strong_thr).sum())
-
-            # tiempo representativo del evento: mediana 0.25 de picks por estación
             t0 = float(np.median(per_sta["t"].values))
 
             events.append({
@@ -190,50 +209,43 @@ def build_events_sliding_window(picksP, win_sec, min_stations, dead_sec, strong_
     return pd.DataFrame(events).sort_values("t0").reset_index(drop=True)
 
 
-
-
 # =====================
 # Funciones para filtrado
 # =====================
-# Normaliza formato de detections
 def normalize_seisbench_detections(det_raw: pd.DataFrame) -> pd.DataFrame:
     d = det_raw.copy()
     d["start_time"] = pd.to_datetime(d["start_time"], errors="coerce")
     d["end_time"]   = pd.to_datetime(d["end_time"], errors="coerce")
     d = d.dropna(subset=["start_time", "end_time"])
     d["station"] = d["station_code"].astype(str)
-    # a epoch seconds para comparar con t0
     d["start_t"] = d["start_time"].astype("int64") / 1e9
     d["end_t"]   = d["end_time"].astype("int64") / 1e9
     return d[["station", "start_t", "end_t"]].sort_values(["station", "start_t"]).reset_index(drop=True)
-# Extrae código de estación
+
 def build_det_index(det_norm: pd.DataFrame):
     idx = {}
     for sta, g in det_norm.groupby("station"):
         idx[sta] = (g["start_t"].to_numpy(), g["end_t"].to_numpy())
     return idx
-# Cuenta detections que apoyan un evento en t0 
+
 def det_support_count(t0, det_idx, slack_sec) -> int:
     tL = t0 - slack_sec
     tR = t0 + slack_sec
     n = 0
     for sta, (starts, ends) in det_idx.items():
-        # Encontrar detections cuyo start <= tR
-        # y verificar si alguna tiene end >= tL
-        # (búsqueda rápida con searchsorted)
         j = np.searchsorted(starts, tR, side="right") - 1
         if j >= 0 and ends[j] >= tL:
             n += 1
     return n
-# Cuenta picks de fase dentro de ventana de evento
+
 def count_phase_support(picks, t0, phase, w0, w1):
-    # picks: tu df normalizado (station, phase, t, prob)
     w = picks[(picks["phase"] == phase) & (picks["t"] >= t0 + w0) & (picks["t"] <= t0 + w1)]
     return w["station"].nunique()
 
-#====================
+
+# =====================
 # Funciones para Localización por grid search
-#====================
+# =====================
 def load_station_nodes(path):
     df = pd.read_csv(path)
 
@@ -254,7 +266,6 @@ def load_station_nodes(path):
     return df[["station", "lat", "lon", "elev_km"]]
 
 def haversine_km(lat1, lon1, lat2, lon2):
-    # distancia aproximada en km
     R = 6371.0
     lat1 = np.deg2rad(lat1); lon1 = np.deg2rad(lon1)
     lat2 = np.deg2rad(lat2); lon2 = np.deg2rad(lon2)
@@ -276,33 +287,19 @@ def picks_for_event(picks, t0, phase, w, topk_per_sta=2, min_prob=0.0):
     d = d[d["rk"] < topk_per_sta].drop(columns=["rk"])
     return d
 
-
-
 def travel_time_layered(dist_km: float, depth_km: float, phase: str) -> float:
-    """
-    Tiempo de viaje con rayo recto en un medio estratificado por capas horizontales.
-    dist_km: distancia horizontal
-    depth_km: profundidad fuente (positiva)
-    phase: "P" o "S"
-    """
     depth_km = float(max(depth_km, 0.0))
-    # longitud total del rayo (recto)
     L = float(np.sqrt(dist_km**2 + depth_km**2))
     if L <= 0:
         return 0.0
 
-    # proyección vertical del rayo: z(s) = (depth/L)*s
-    # => fracción de camino dentro de cada intervalo de profundidad
     tt = 0.0
-    z0 = 0.0
     z1 = depth_km
 
-    # recorre capas desde z=0 hasta z=depth_km
     for i, (th, vp, vs) in enumerate(VEL_LAYERS):
         top = LAYER_TOPS[i]
         bot = LAYER_TOPS[i+1]
 
-        # segmento del rayo que cae dentro de [top, bot] intersectado con [0, depth]
         a = max(top, 0.0)
         b = min(bot, z1)
         if b <= a:
@@ -310,7 +307,6 @@ def travel_time_layered(dist_km: float, depth_km: float, phase: str) -> float:
                 break
             continue
 
-        # convertir tramo vertical (dz) a tramo a lo largo del rayo (ds)
         dz = b - a
         ds = dz * (L / depth_km) if depth_km > 0 else 0.0
 
@@ -327,7 +323,6 @@ def locate_event_grid(pP, pS, stations,
                       lon_min=LON_MIN, lon_max=LON_MAX, dlon=DLON,
                       depths_km=DEPTHS_KM):
 
-    # ---- arma observaciones ----
     obs = []
     for _, r in pP.iterrows():
         if r["station"] in stations.index:
@@ -346,10 +341,8 @@ def locate_event_grid(pP, pS, stations,
     phases  = np.array([o[1] for o in obs])
     t_obs   = np.array([o[2] for o in obs])
 
-    
-
     def eval_grid(lats, lons, depths, label="grid"):
-        bests = []  # heap de tamaño COARSE_TOPK: (-rms, cand)
+        bests = []
         total = len(depths) * len(lats) * len(lons)
         k = 0
 
@@ -366,7 +359,7 @@ def locate_event_grid(pP, pS, stations,
 
                     t_origin = np.median(t_obs - tt)
                     res = (t_obs - (t_origin + tt))
-                    score = np.median(np.abs(res))   # L1 robusto
+                    score = np.median(np.abs(res))
 
                     cand = (score, float(lat), float(lon), dep, float(t_origin))
 
@@ -388,9 +381,6 @@ def locate_event_grid(pP, pS, stations,
         top.sort(key=lambda x: x[0])
         return top
 
-
-
-    # ---- COARSE ----
     lats_c = np.arange(lat_min, lat_max + 1e-12, DLAT_C)
     lons_c = np.arange(lon_min, lon_max + 1e-12, DLON_C)
 
@@ -398,22 +388,15 @@ def locate_event_grid(pP, pS, stations,
     if not cands:
         return None
 
-    # --- SOLO LOS N MEJORES COARSE para Fine-1 ---
     cands = cands[:N_FINE1_FROM_COARSE]
+    best_f1 = None
 
-    best_f1 = None  # mejor candidato después de Fine-1
-
-    # =========================
-    # Fine-1: solo N candidatos
-    # =========================
     for ic, (rms_c, lat_c, lon_c, dep_c, torig_c) in enumerate(cands, start=1):
-
         lat0 = max(lat_min, lat_c - REFINE1_HALFSPAN_DEG)
         lat1 = min(lat_max, lat_c + REFINE1_HALFSPAN_DEG)
         lon0 = max(lon_min, lon_c - REFINE1_HALFSPAN_DEG)
         lon1 = min(lon_max, lon_c + REFINE1_HALFSPAN_DEG)
 
-        # depths fine alrededor del depth coarse
         z0 = max(0.5, float(dep_c) - DEPTH_FINE_HALFSPAN_KM)
         z1 = float(dep_c) + DEPTH_FINE_HALFSPAN_KM
         depths_f1 = np.arange(z0, z1 + 1e-12, DEPTH_FINE_DZ_KM)
@@ -422,15 +405,11 @@ def locate_event_grid(pP, pS, stations,
         lons_f1 = np.arange(lon0, lon1 + 1e-12, DLON_F1)
 
         fine1 = eval_grid(lats_f1, lons_f1, depths_f1, label=f"fine1_{ic}")
-
         cand_f1 = fine1[0] if fine1 else (rms_c, lat_c, lon_c, dep_c, torig_c)
 
         if (best_f1 is None) or (cand_f1[0] < best_f1[0]):
             best_f1 = cand_f1
 
-    # =========================
-    # Fine-2: 1 sola vez (alta res)
-    # =========================
     if best_f1 is None:
         return None
 
@@ -455,12 +434,7 @@ def locate_event_grid(pP, pS, stations,
     else:
         return best_f1
 
-
-
-
-
 def build_layer_tops(layers):
-    # Devuelve límites acumulados: [0, z1, z2, ...]
     tops = [0.0]
     z = 0.0
     for th, _, _ in layers:
@@ -471,19 +445,11 @@ def build_layer_tops(layers):
 LAYER_TOPS = build_layer_tops(VEL_LAYERS)
 
 
-
-#====================
-# Funciones para comparar eventos localizados con catálogo oficial
-#====================
-
+# =====================
+# Match con catálogo oficial
+# =====================
 def match_loc_to_official(official_df: pd.DataFrame, loc_df: pd.DataFrame,
                           t_tol=T_TOL, d_tol_km=D_TOL_KM, z_tol_km=Z_TOL_KM):
-    """
-    Retorna tabla por cada oficial con el mejor match (si existe).
-    Requiere:
-      official_df: t0_utc, lat, lon, depth_km
-      loc_df: origin_time_utc, lat, lon, depth_km
-    """
     off = official_df.copy()
     loc = loc_df[loc_df["ok"] == True].copy()
 
@@ -496,11 +462,9 @@ def match_loc_to_official(official_df: pd.DataFrame, loc_df: pd.DataFrame,
     for i, r in off.iterrows():
         t_off = float(pd.to_datetime(r["t0"]).value / 1e9)
 
-        # candidatos por tiempo
         dt = np.abs(loc_t - t_off)
         cand_idx = np.where(dt <= t_tol)[0]
         if cand_idx.size == 0:
-            # Diagnóstico: evento localizado más cercano en tiempo (aunque esté fuera de tolerancia)
             if len(loc_t) > 0:
                 j_near = int(np.argmin(np.abs(loc_t - t_off)))
                 rrn = loc.iloc[j_near]
@@ -514,7 +478,6 @@ def match_loc_to_official(official_df: pd.DataFrame, loc_df: pd.DataFrame,
                 event_idx_near = int(rrn["event_idx"])
                 rms_near = float(rrn.get("rms_sec", np.nan))
             else:
-                j_near = None
                 dt_near = np.nan
                 dkm_near = np.nan
                 dz_near = np.nan
@@ -533,8 +496,6 @@ def match_loc_to_official(official_df: pd.DataFrame, loc_df: pd.DataFrame,
                 "dep_off": float(r["depth_km"]),
                 "is_match": False,
                 "score": np.nan,
-
-                # info del localizado más cercano (para debug)
                 "event_idx": event_idx_near,
                 "t0_loc": t0_loc_near,
                 "lat_loc": lat_loc_near,
@@ -547,7 +508,6 @@ def match_loc_to_official(official_df: pd.DataFrame, loc_df: pd.DataFrame,
             })
             continue
 
-
         best = None
         for j in cand_idx:
             rr = loc.iloc[j]
@@ -556,7 +516,6 @@ def match_loc_to_official(official_df: pd.DataFrame, loc_df: pd.DataFrame,
             dtj = float(loc_t[j] - t_off)
 
             ok = (dkm <= d_tol_km) and (dz <= z_tol_km)
-            # score: prioriza tiempo, luego distancia, luego profundidad
             score = abs(dtj) + 0.2*dkm + 0.1*dz
 
             if ok and ((best is None) or (score < best["score"])):
@@ -580,13 +539,12 @@ def match_loc_to_official(official_df: pd.DataFrame, loc_df: pd.DataFrame,
                 }
 
         if best is None:
-            # si no hubo ok por dist/prof, guarda el más cercano en tiempo para diagnosticar
             j0 = cand_idx[np.argmin(dt[cand_idx])]
             rr0 = loc.iloc[j0]
             dkm0 = haversine_km(r["lat"], r["lon"], rr0["lat"], rr0["lon"])
             dz0  = abs(float(r["depth_km"]) - float(rr0["depth_km"]))
             dt0  = float(loc_t[j0] - t_off)
-            
+
             out_rows.append({
                 "idx_official": i,
                 "is_match": False,
@@ -599,46 +557,114 @@ def match_loc_to_official(official_df: pd.DataFrame, loc_df: pd.DataFrame,
                 "lat_off": float(r["lat"]),
                 "lon_off": float(r["lon"]),
                 "dep_off": float(r["depth_km"]),
-
             })
         else:
             out_rows.append(best)
 
     return pd.DataFrame(out_rows)
 
-def main():
-    t_start = time.time() # inicio medicion tiempo de ejecucion
 
-    official = load_official_day(OFFICIAL_CSV, OFFICIAL_DAY)
-    print(f"Oficial {OFFICIAL_DAY}: {len(official)} eventos")
+def _locate_one_event(idx, ev_row):
+    global _G_PICKS, _G_STATIONS
 
-    raw_picks = pd.read_csv(PICKS_CSV) # carga picks
-    print(f"Picks SeisBench cargados: {len(raw_picks)}({PICKS_CSV})")
+    t0 = float(ev_row["t0"])
+    picks = _G_PICKS
+    stations = _G_STATIONS
 
-    picks = normalize_eqt_picks(raw_picks) # normaliza formato picks
+    pP = picks_for_event(picks, t0, "P", P_WIN)
+    pS = picks_for_event(picks, t0, "S", S_WIN)
+
+    nsta = int(ev_row["n_stations"])
+
+    sol = locate_event_grid(pP, pS, stations)
+
+    if sol is None:
+        return {
+            "event_idx": int(idx),
+            "t0_seed": pd.to_datetime(t0, unit="s"),
+            "ok": False,
+            "nP": int(len(pP)),
+            "nS": int(len(pS)),
+            "nsta_event": nsta,
+            "det_support": int(ev_row.get("det_support", 0)),
+            "S_support": int(ev_row.get("S_support", 0)),
+        }
+
+    rms, lat, lon, dep, torigin = sol
+    return {
+        "event_idx": int(idx),
+        "t0_seed": pd.to_datetime(t0, unit="s"),
+        "origin_time_utc": pd.to_datetime(torigin, unit="s"),
+        "lat": float(lat),
+        "lon": float(lon),
+        "depth_km": float(dep),
+        "rms_sec": float(rms),
+        "nP": int(len(pP)),
+        "nS": int(len(pS)),
+        "nsta_event": nsta,
+        "maxprob": float(ev_row["maxprob"]),
+        "det_support": int(ev_row["det_support"]),
+        "S_support": int(ev_row["S_support"]),
+        "ok": True,
+    }
+
+
+# Globals
+_G_PICKS = None
+_G_STATIONS = None
+
+def _init_worker(picks, stations):
+    global _G_PICKS, _G_STATIONS
+    _G_PICKS = picks
+    _G_STATIONS = stations
+
+
+def main(year, jday):
+    t_start = time.time()
+
+    official_day = jday_to_yyyymmdd(year, jday)
+    jstr = f"{year}{jday:03d}"
+
+    OFFICIAL_CSV = official_csv_for_day(jday)
+    PICKS_CSV = picks_csv_for_day(year, jday)
+    DETECTIONS_CSV = detections_csv_for_day(year, jday)
+    OUT_EVENTS_LOC_CSV = out_events_loc_csv_for_day(year, jday)
+
+    print("\n" + "=" * 70)
+    print(f"Procesando YEAR={year}, JDAY={jday}, DATE={official_day}")
+    print(f"Official   : {OFFICIAL_CSV}")
+    print(f"Picks      : {PICKS_CSV}")
+    print(f"Detections : {DETECTIONS_CSV}")
+    print("=" * 70)
+
+    official = load_official_day(OFFICIAL_CSV, official_day)
+    print(f"Oficial {official_day}: {len(official)} eventos")
+
+    raw_picks = pd.read_csv(PICKS_CSV)
+    print(f"Picks SeisBench cargados: {len(raw_picks)} ({PICKS_CSV})")
+
+    picks = normalize_eqt_picks(raw_picks)
     print(f"Picks normalizados: {len(picks)}  columnas={list(picks.columns)}")
 
-    # ---- Binning P ----
-    picksP = bin_best_pick_per_station(picks, bin_sec=BIN_SEC, phase="P") 
+    picksP = bin_best_pick_per_station(picks, bin_sec=BIN_SEC, phase="P")
     print(f"\nP-picks tras bin ({BIN_SEC:.0f}s): {len(picksP)}")
 
-    # ---- Construccion de eventos con ventana ----
-    events_det = build_events_sliding_window( 
+    events_det = build_events_sliding_window(
         picksP, win_sec=WIN_SEC, min_stations=MIN_STATIONS, dead_sec=DEAD_SEC, strong_thr=STRONG_THR
     )
     print(f"Eventos sin filtro: {len(events_det)}")
 
-    # cargar detections si existe
-    
     det_raw = pd.read_csv(DETECTIONS_CSV)
     det_norm = normalize_seisbench_detections(det_raw)
     det_idx = build_det_index(det_norm)
 
-    # calcula soporte para cada evento
-    events_det["det_support"] = events_det["t0"].apply(lambda t0: det_support_count(t0, det_idx, slack_sec=2.0))
-    events_det["S_support"] = events_det["t0"].apply(lambda t0: count_phase_support(picks, t0, "S", -3, 20.0))
+    events_det["det_support"] = events_det["t0"].apply(
+        lambda t0: det_support_count(t0, det_idx, slack_sec=2.0)
+    )
+    events_det["S_support"] = events_det["t0"].apply(
+        lambda t0: count_phase_support(picks, t0, "S", -3, 20.0)
+    )
 
-    # ---- Filtrado de eventos ----
     events_loc = events_det[
         (events_det["n_stations"] >= F_MIN_STATIONS) &
         (events_det["maxprob"] >= F_MAXPROB) &
@@ -646,90 +672,80 @@ def main():
         (events_det["det_support"] >= F_MIN_DET_SUPPORT) &
         (events_det["S_support"] >= F_MIN_S_SUPPORT)
     ].reset_index(drop=True)
+    print(f"\nEventos tras filtrado: {len(events_loc)}")
 
-
-    print(
-        f"\nEventos tras filtrado: {len(events_loc)} "
-    )
-    
     stations = load_station_nodes(NODES_CSV).set_index("station")
-    print(f"Estaciones cargadas: {len(stations)}")
+
+    n_workers = 20
+    print("workers:", n_workers)
 
     rows = []
-    for idx, ev in events_loc.iterrows():
-        t0 = float(ev["t0"])
-        t_event_start = time.time()
 
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        initializer=_init_worker,
+        initargs=(picks, stations)
+    ) as ex:
+        futs = [ex.submit(_locate_one_event, idx, ev) for idx, ev in events_loc.iterrows()]
 
-        
+        for k, f in enumerate(as_completed(futs), start=1):
+            rows.append(f.result())
+            if k % 5 == 0:
+                print(f"locados {k}/{len(futs)}", end="\r")
 
-        pP = picks_for_event(picks, t0, "P", P_WIN)
-        pS = picks_for_event(picks, t0, "S", S_WIN)
-        nsta = int(ev["n_stations"])
-        nP = int(pP["station"].nunique()) if not pP.empty else 0
-        nS = int(pS["station"].nunique()) if not pS.empty else 0
-        if (idx % PRINT_EVERY) == 0:
-            print(f"\n[LOC] evento {idx+1}/{len(events_loc)}  t0={pd.to_datetime(t0, unit='s')}  nsta={nsta}  nP={nP}  nS={nS}  det={int(ev['det_support'])}  Ssupp={int(ev['S_support'])}")
-
-
-        sol = locate_event_grid(pP, pS, stations)
-        if sol is None:
-            print(f"[LOC]   -> FAIL (pocos picks)  nP={len(pP)} nS={len(pS)}  dt={time.time()-t_event_start:.1f}s")
-            rows.append({
-                "event_idx": int(idx),
-                "t0_seed": pd.to_datetime(t0, unit="s"),
-                "ok": False,
-                "nP": int(len(pP)),
-                "nS": int(len(pS)),
-            })
-            
-            continue
-
-        rms, lat, lon, dep, torigin = sol
-        print(f"[LOC]   -> OK  medAbs={rms:.3f}s  lat={lat:.3f} lon={lon:.3f} z={dep:.1f}km  nsta={nsta} nPsta={nP} nSsta={nS}  dt={time.time()-t_event_start:.1f}s")
-
-        rows.append({
-            "event_idx": int(idx),
-            "t0_seed": pd.to_datetime(t0, unit="s"),
-            "origin_time_utc": pd.to_datetime(torigin, unit="s"),
-            "lat": lat,
-            "lon": lon,
-            "depth_km": dep,
-            "rms_sec": rms,
-            "nP": int(len(pP)),
-            "nS": int(len(pS)),
-            "nsta_event": int(ev["n_stations"]),
-            "maxprob": float(ev["maxprob"]),
-            "det_support": int(ev["det_support"]),
-            "S_support": int(ev["S_support"]),
-            "ok": True,
-        })
-
-    loc_df = pd.DataFrame(rows).sort_values("origin_time_utc")
-    # loc_df.to_csv(OUT_EVENTS_LOC_CSV, index=False)
-
-    # comparar con oficial si existe
+    loc_df = pd.DataFrame(rows)
+    loc_df = loc_df[
+        (loc_df["ok"] == True) &
+        (loc_df["rms_sec"] <= 0.8)   # o 0.4s para ser más estricto
+    ].copy()
+    if not loc_df.empty:
+        loc_df = loc_df.sort_values("origin_time_utc", na_position="last")
+    print(f"\nEventos tras filtrado rms: {len(loc_df)}")
     m = match_loc_to_official(official, loc_df)
     m_ok = m[m["is_match"] == True].copy()
     m_bad = m[m["is_match"] == False].copy()
-    m_ok["event_idx"] = m_ok["event_idx"].astype(int)
+
+    if not m_ok.empty:
+        m_ok["event_idx"] = m_ok["event_idx"].astype(int)
 
     print("\n=== MATCH LOCALIZADO vs OFICIAL (solo matches) ===")
-    print(m_ok.sort_values("score").to_string(index=False))
+    print(m_ok.sort_values("score").to_string(index=False) if not m_ok.empty else "Sin matches")
 
     print("\n=== NO MATCH (detalle) ===")
-    print(m_bad.to_string(index=False))
-    print("shape:", m_bad.shape)
-    print("cols:", list(m_bad.columns))
+    print(m_bad.to_string(index=False) if not m_bad.empty else "Sin no-matches")
 
-    print("median dist km:", m_ok["dist_km"].median())
-    print("p90 dist km:", m_ok["dist_km"].quantile(0.9))
+    if not m_ok.empty:
+        print("median dist km:", m_ok["dist_km"].median())
+        print("p90 dist km:", m_ok["dist_km"].quantile(0.9))
+
+    print(f"\nTotal oficiales: {len(m)}")
+    print(f"Eventos con match: {len(m_ok)}")
+    print(f"Eventos sin match: {len(m_bad)}")
+
+    loc_df.to_csv(OUT_EVENTS_LOC_CSV, index=False)
+    print("Guardado:", OUT_EVENTS_LOC_CSV)
+
+    print(f"\n⏱ Total {jstr}: {time.time() - t_start:.1f}s")
+
+    return loc_df, m_ok, m_bad
 
 
+# =====================
+# Ejecutar varios días secuencialmente
+# =====================
+all_results = {}
 
-    #print(f"💾 Localizaciones guardadas: {OUT_EVENTS_LOC_CSV}  (ok={loc_df['ok'].sum()}/{len(loc_df)})")
-    print(f"\n⏱ Total: {time.time() - t_start:.1f}s")
+for jday in JDAYS:
+    try:
+        loc_df, m_ok, m_bad = main(YEAR, jday)
+        all_results[jday] = {
+            "loc_df": loc_df,
+            "m_ok": m_ok,
+            "m_bad": m_bad,
+        }
+    except FileNotFoundError as e:
+        print(f"\n[ERROR] Falta archivo para JDAY {jday}: {e}")
+    except Exception as e:
+        print(f"\n[ERROR] Falló JDAY {jday}: {e}")
 
-
-if __name__ == "__main__":
-    main()
+print("\nDías procesados:", list(all_results.keys()))
