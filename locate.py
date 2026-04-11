@@ -6,6 +6,7 @@ import pandas as pd
 import heapq
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from sklearn.cluster import DBSCAN
 
 # =====================
 # Configuracion temporal
@@ -607,7 +608,46 @@ def _locate_one_event(idx, ev_row):
         "S_support": int(ev_row["S_support"]),
         "ok": True,
     }
+# =====================
+# Nueva función — agregar después de tag_clusters()
+# =====================
+def tag_clusters(loc_df: pd.DataFrame,
+                 eps_km: float = 15.0,
+                 min_samples: int = 5) -> pd.DataFrame:
+    """
+    Asigna cluster_id a cada evento localizado usando DBSCAN espacial.
+    cluster_id = -1 → ruido (evento aislado)
+    cluster_id >= 0  → cluster coherente
+    """
+    df = loc_df.copy()
+    df["cluster_id"] = -1  # default: ruido
 
+    mask = df["ok"] == True
+    coords = df.loc[mask, ["lat", "lon"]].dropna()
+
+    if len(coords) < min_samples:
+        print(f"[DBSCAN] Muy pocos eventos ({len(coords)}) para clusterizar.")
+        return df
+
+    coords_rad = np.deg2rad(coords.values)
+    eps_rad = eps_km / 6371.0
+
+    db = DBSCAN(
+        eps=eps_rad,
+        min_samples=min_samples,
+        algorithm="ball_tree",
+        metric="haversine"
+    ).fit(coords_rad)
+
+    df.loc[coords.index, "cluster_id"] = db.labels_
+
+    n_clusters = len(set(db.labels_)) - (1 if -1 in db.labels_ else 0)
+    n_noise    = int((db.labels_ == -1).sum())
+    print(f"[DBSCAN] eps={eps_km} km | min_samples={min_samples} → "
+          f"{n_clusters} clusters, {n_noise} eventos ruido "
+          f"({100*n_noise/len(coords):.1f}%)")
+
+    return df
 
 # Globals
 _G_PICKS = None
@@ -698,10 +738,29 @@ def main(year, jday):
         (loc_df["ok"] == True) &
         (loc_df["rms_sec"] <= 0.8)   # o 0.4s para ser más estricto
     ].copy()
+    print(f"\nEventos tras filtrado rms: {len(loc_df)}")
+    # --- Después de ensamblar loc_df ---
     if not loc_df.empty:
         loc_df = loc_df.sort_values("origin_time_utc", na_position="last")
-    print(f"\nEventos tras filtrado rms: {len(loc_df)}")
-    m = match_loc_to_official(official, loc_df)
+
+    # ← AGREGA AQUÍ
+    loc_df = tag_clusters(
+        loc_df,
+        eps_km=15.0,    # radio en km para definir vecindad
+        min_samples=5   # mínimo de eventos para formar cluster
+    )
+
+    # Opcional: exportar solo los clusters coherentes
+    loc_df_clustered = loc_df[
+        (loc_df["ok"] == True) &
+        (loc_df["cluster_id"] >= 0)
+    ].copy()
+    print(f"Eventos en clusters: {len(loc_df_clustered)} / "
+          f"{(loc_df['ok']==True).sum()} localizados")
+
+    # Usa loc_df_clustered para el match si quieres ser estricto,
+    # o usa loc_df completo (con cluster_id como columna informativa)
+    m = match_loc_to_official(official, loc_df_clustered)   # o loc_df_clustered
     m_ok = m[m["is_match"] == True].copy()
     m_bad = m[m["is_match"] == False].copy()
 
@@ -721,8 +780,8 @@ def main(year, jday):
     print(f"\nTotal oficiales: {len(m)}")
     print(f"Eventos con match: {len(m_ok)}")
     print(f"Eventos sin match: {len(m_bad)}")
-
-    loc_df.to_csv(OUT_EVENTS_LOC_CSV, index=False)
+    print(f"\nEventos finales: {len(loc_df_clustered)}")
+    loc_df_clustered.to_csv(OUT_EVENTS_LOC_CSV, index=False)
     print("Guardado:", OUT_EVENTS_LOC_CSV)
 
     print(f"\n⏱ Total {jstr}: {time.time() - t_start:.1f}s")
