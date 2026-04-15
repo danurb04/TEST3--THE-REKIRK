@@ -24,33 +24,34 @@ NODES_CSV = BASE_IN / "XML_Cartago_Nodes.csv"
 BASE_OUT = Path("/data/murbina/seismo/results/catalogs/Test2")
 BASE_OUT.mkdir(parents=True, exist_ok=True)
 
+
 # Tolerancia para match entre eventos IA y oficiales
 T_TOL = 1.0
 D_TOL_KM = 15.0
 Z_TOL_KM = 10.0
 
 # Parámetros para construir eventos
-BIN_SEC = 8.0 # agrupa picks en este tiempo (en una misma estacion) para quedarse con el más fuerte 
-WIN_SEC = 30.0 # tamaño de ventana para agrupar picks P entre estaciones 
+BIN_SEC = 11.666460891503132  # agrupa picks en este tiempo (en una misma estacion) para quedarse con el más fuerte 
+WIN_SEC = 33.13564416676824 # tamaño de ventana para agrupar picks P entre estaciones 
 MIN_STATIONS = 3 # mínimo de estaciones con picks P para considerar un evento
-DEAD_SEC = 18.0 # tiempo mínimo entre eventos 
+DEAD_SEC = 9.21132846069997 # tiempo mínimo entre eventos 
 
 # Parametros para filtrar eventos 
 STRONG_THR = 0.75 # umbral de probabilidad para considerar un pick como “fuerte” 
-F_MIN_STATIONS = 7 # mínimo de estaciones con picks P 
-F_MAXPROB = 0.85 # probabilidad máxima necesaria de una estación para considerar un evento 
+F_MIN_STATIONS = 8 # mínimo de estaciones con picks P 
+F_MAXPROB = 0.8632901892596616 # probabilidad máxima necesaria de una estación para considerar un evento 
 F_MIN_STRONG = 3 # mínimo de estaciones con picks P fuertes para un mismo evento
-F_MIN_DET_SUPPORT = 40  # mínimo de detecciones (no picks) dentro de un evento para considerarlo 
-F_MIN_S_SUPPORT = 10 # mínimo de picks S dentro de un evento para considerarlo
+F_MIN_DET_SUPPORT = 22  # mínimo de detecciones (no picks) dentro de un evento para considerarlo 
+F_MIN_S_SUPPORT = 11 # mínimo de picks S dentro de un evento para considerarlo
 
 # Ventana para asignar picks al evento
-P_WIN = (-5.0, 10.0)
-S_WIN = (-3.0, 25.0)
+P_WIN = (-4.066576938188511, 7.337208231670156)
+S_WIN = (-3.0864797724218374, 34.5997751302812)
 
 # Grid
 LAT_MIN, LAT_MAX, DLAT = 9.25, 10.12, 0.01
 LON_MIN, LON_MAX, DLON = -84.7, -83.16, 0.01
-DEPTHS_KM = [1, 3, 5, 8, 10, 15, 20]
+DEPTHS_KM = [2.771141348959358, 3.004608919681081, 8.02720600691255, 12.969199708783881, 17.658516853015016, 21.964726516510684]
 
 # Modelo 1D por capas
 VEL_LAYERS = [
@@ -74,23 +75,23 @@ VEL_LAYERS = [
 # Coarse grid
 DLAT_C = 0.05
 DLON_C = 0.05
-DEPTHS_COARSE = [3, 8, 15]
-COARSE_TOPK = 8
+DEPTHS_COARSE = [2.2497505686685226, 10.69111740332143, 22.04728751688021]
+COARSE_TOPK = 12
 
 # Fine-1
-N_FINE1_FROM_COARSE = 2
-REFINE1_HALFSPAN_DEG = 0.06
+N_FINE1_FROM_COARSE = 4
+REFINE1_HALFSPAN_DEG =  0.11769345949091765
 DLAT_F1 = 0.01
 DLON_F1 = 0.01
-DEPTH_FINE_HALFSPAN_KM = 8.0
-DEPTH_FINE_DZ_KM = 0.5
+DEPTH_FINE_HALFSPAN_KM = 13.323975939643066
+DEPTH_FINE_DZ_KM = 1.3293445212523969
 
 # Fine-2
-REFINE2_HALFSPAN_DEG = 0.01
+REFINE2_HALFSPAN_DEG = 0.01671788552306872
 DLAT_F2 = 0.002
 DLON_F2 = 0.002
-DEPTH2_HALFSPAN_KM = 2.0
-DEPTH2_DZ_KM = 0.25
+DEPTH2_HALFSPAN_KM = 3.818546726757031
+DEPTH2_DZ_KM = 0.32708685650203473
 
 # Progreso
 PRINT_EVERY = 999999
@@ -612,8 +613,8 @@ def _locate_one_event(idx, ev_row):
 # Nueva función — agregar después de tag_clusters()
 # =====================
 def tag_clusters(loc_df: pd.DataFrame,
-                 eps_km: float = 15.0,
-                 min_samples: int = 5) -> pd.DataFrame:
+                 eps_km: float = 8.511292323882095,
+                 min_samples: int = 3) -> pd.DataFrame:
     """
     Asigna cluster_id a cada evento localizado usando DBSCAN espacial.
     cluster_id = -1 → ruido (evento aislado)
@@ -657,7 +658,34 @@ def _init_worker(picks, stations):
     global _G_PICKS, _G_STATIONS
     _G_PICKS = picks
     _G_STATIONS = stations
+    
+def build_run_summary(all_results: dict) -> pd.DataFrame:
+    rows = []
 
+    for jday, res in sorted(all_results.items()):
+        loc_df = res["loc_df"]      # eventos automáticos finales de ese día
+        m_ok   = res["m_ok"]        # matches de ese día
+        m_bad  = res["m_bad"]       # no matches de ese día
+
+        n_auto = len(loc_df)
+        n_match = len(m_ok)
+        n_official = len(m_ok) + len(m_bad)
+
+        precision_pct = (100.0 * n_match / n_auto) if n_auto > 0 else np.nan
+        match_pct = (100.0 * n_match / n_official) if n_official > 0 else np.nan
+        mean_dist_km = float(m_ok["dist_km"].mean()) if not m_ok.empty else np.nan
+
+        rows.append({
+            "jday": jday,
+            "n_auto_final": n_auto,
+            "n_official": n_official,
+            "n_match": n_match,
+            "precision_pct": precision_pct,
+            "match_pct": match_pct,
+            "mean_dist_km": mean_dist_km,
+        })
+
+    return pd.DataFrame(rows)
 
 def main(year, jday):
     t_start = time.time()
@@ -732,22 +760,22 @@ def main(year, jday):
             rows.append(f.result())
             if k % 5 == 0:
                 print(f"locados {k}/{len(futs)}", end="\r")
-
+                
     loc_df = pd.DataFrame(rows)
     loc_df = loc_df[
         (loc_df["ok"] == True) &
-        (loc_df["rms_sec"] <= 0.8)   # o 0.4s para ser más estricto
+        (loc_df["rms_sec"] <= 1.0622906587137428)   # o 0.4s para ser más estricto
     ].copy()
     print(f"\nEventos tras filtrado rms: {len(loc_df)}")
     # --- Después de ensamblar loc_df ---
     if not loc_df.empty:
         loc_df = loc_df.sort_values("origin_time_utc", na_position="last")
-
+    
     # ← AGREGA AQUÍ
     loc_df = tag_clusters(
         loc_df,
-        eps_km=15.0,    # radio en km para definir vecindad
-        min_samples=5   # mínimo de eventos para formar cluster
+        eps_km=8.511292323882095,    # radio en km para definir vecindad
+        min_samples= 3   # mínimo de eventos para formar cluster
     )
 
     # Opcional: exportar solo los clusters coherentes
@@ -757,13 +785,14 @@ def main(year, jday):
     ].copy()
     print(f"Eventos en clusters: {len(loc_df_clustered)} / "
           f"{(loc_df['ok']==True).sum()} localizados")
-
+    
     # Usa loc_df_clustered para el match si quieres ser estricto,
     # o usa loc_df completo (con cluster_id como columna informativa)
+    
     m = match_loc_to_official(official, loc_df_clustered)   # o loc_df_clustered
     m_ok = m[m["is_match"] == True].copy()
     m_bad = m[m["is_match"] == False].copy()
-
+    
     if not m_ok.empty:
         m_ok["event_idx"] = m_ok["event_idx"].astype(int)
 
@@ -781,12 +810,27 @@ def main(year, jday):
     print(f"Eventos con match: {len(m_ok)}")
     print(f"Eventos sin match: {len(m_bad)}")
     print(f"\nEventos finales: {len(loc_df_clustered)}")
+    n_auto_final = len(loc_df_clustered)
+    n_match = len(m_ok)
+    n_official = len(m_ok) + len(m_bad)
+    
+    precision_day = (100.0 * n_match / n_auto_final) if n_auto_final > 0 else np.nan
+    match_pct_day = (100.0 * n_match / n_official) if n_official > 0 else np.nan
+    mean_dist_day = float(m_ok["dist_km"].mean()) if not m_ok.empty else np.nan
+    
+    print("\n=== RESUMEN DEL DÍA ===")
+    print(f"Eventos automáticos finales : {n_auto_final}")
+    print(f"Eventos oficiales           : {n_official}")
+    print(f"Matches                     : {n_match}")
+    print(f"Precisión del workflow      : {precision_day:.2f}%")
+    print(f"Porcentaje de matches       : {match_pct_day:.2f}%")
+    print(f"Distancia promedio          : {mean_dist_day:.2f} km")
     loc_df_clustered.to_csv(OUT_EVENTS_LOC_CSV, index=False)
     print("Guardado:", OUT_EVENTS_LOC_CSV)
 
     print(f"\n⏱ Total {jstr}: {time.time() - t_start:.1f}s")
 
-    return loc_df, m_ok, m_bad
+    return loc_df_clustered, m_ok, m_bad
 
 
 # =====================
@@ -808,3 +852,40 @@ for jday in JDAYS:
         print(f"\n[ERROR] Falló JDAY {jday}: {e}")
 
 print("\nDías procesados:", list(all_results.keys()))
+print("\n" + "=" * 70)
+print("RESUMEN GENERAL DEL WORKFLOW")
+print("=" * 70)
+
+if all_results:
+    summary_df = build_run_summary(all_results)
+
+    total_auto = int(summary_df["n_auto_final"].sum())
+    total_official = int(summary_df["n_official"].sum())
+    total_matches = int(summary_df["n_match"].sum())
+
+    precision_global = (100.0 * total_matches / total_auto) if total_auto > 0 else np.nan
+    match_pct_global = (100.0 * total_matches / total_official) if total_official > 0 else np.nan
+
+    all_distances = pd.concat(
+        [res["m_ok"]["dist_km"] for res in all_results.values() if not res["m_ok"].empty],
+        ignore_index=True
+    )
+    mean_dist_global = float(all_distances.mean()) if not all_distances.empty else np.nan
+
+    print("\n=== RESUMEN POR DÍA ===")
+    print(summary_df.to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+
+    print("\n=== RESUMEN GLOBAL ===")
+    print(f"Eventos automáticos finales : {total_auto}")
+    print(f"Eventos oficiales           : {total_official}")
+    print(f"Matches totales             : {total_matches}")
+    print(f"Precisión global            : {precision_global:.2f}%")
+    print(f"Porcentaje de matches       : {match_pct_global:.2f}%")
+    print(f"Distancia promedio global   : {mean_dist_global:.2f} km")
+
+    summary_csv = BASE_OUT / "workflow_summary.csv"
+    summary_df.to_csv(summary_csv, index=False)
+    print(f"\nResumen guardado en: {summary_csv}")
+
+else:
+    print("No hubo días procesados correctamente.")
