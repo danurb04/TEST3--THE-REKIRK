@@ -36,8 +36,8 @@ MAX_PAIRS_PER_EVENT = 50  # cap pairs per event for efficiency
 N_JOBS         = 20       # parallel workers
 
 # GrowClust tuning grid (rmsmax, rmincut)
-TUNE_RMSMAX    = [0.10, 0.15, 0.20, 0.25, 0.30]
-TUNE_RMINCUT   = [0.0,  0.3,  0.5]
+TUNE_RMSMAX  = [0.15, 0.20, 0.25, 0.30, 0.35, 0.40]
+TUNE_RMINCUT = [0.0, 0.2, 0.3] 
 
 # Match tolerance for evaluation
 MATCH_DT_SEC   = 15.0

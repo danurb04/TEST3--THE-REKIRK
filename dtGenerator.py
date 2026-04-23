@@ -33,10 +33,10 @@ OUTPUT_DTCC   = "/data/murbina/seismo/results/growclust/IN/dt.cc"
 CC_FREQMIN = 1.0
 CC_FREQMAX = 15.0
 CC_WIN_P   = (-0.5, 2.5)   # segundos
-CC_WIN_S   = (-0.5, 4.0)   # segundos
-CC_MIN_R   = 0.5
-CC_MAX_DIST_KM = 120.0
-MAX_PAIRS_PER_EVENT = 50
+CC_WIN_S   = (-1, 6.0)   # segundos
+CC_MIN_R   = 0.3
+CC_MAX_DIST_KM = 200
+MAX_PAIRS_PER_EVENT = 150
 N_JOBS = 20
 
 # velocidades promedio simples, igual idea que tu script original
@@ -292,12 +292,20 @@ def xcorr_pair(pair_idx):
             t_pick_i = t_i + tphase_i + pre + half
             t_pick_j = t_j + tphase_j + pre + half
 
-            tr_i = load_trace(gi[sta_code], t_pick_i, half + 1.0, cha_pref)
-            tr_j = load_trace(gj[sta_code], t_pick_j, half + 1.0, cha_pref)
-
-            if tr_i is None or tr_j is None:
-                continue
-
+            amps_cc = []
+            for end in ('E','N','1','2'):
+                tr_i = load_trace(gi[sta_code], t_pick_i, half+1.0, (end,))
+                tr_j = load_trace(gj[sta_code], t_pick_j, half+1.0, (end,))
+                if tr_i is None or tr_j is None: continue
+                try:
+                    tr_i.trim(...); tr_j.trim(...)
+                    cc = correlate(tr_i, tr_j, int(tr_i.stats.sampling_rate*0.5))
+                    shift, coeff = xcorr_max(cc)
+                    amps_cc.append((shift, coeff))
+                except: continue
+            if amps_cc:
+                # tomar el de mayor |coeff|
+                shift, coeff = max(amps_cc, key=lambda x: abs(x[1]))
             try:
                 tr_i.trim(t_pick_i - half, t_pick_i + half)
                 tr_j.trim(t_pick_j - half, t_pick_j + half)
